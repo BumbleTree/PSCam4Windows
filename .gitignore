@@ -1,0 +1,20 @@
+# Compiled binaries and build artifacts
+build/
+
+# MSVC compiler intermediate files
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.suo
+*.user
+.vs/
+
+# Local log files
+*.log
+verify_exit.log
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini

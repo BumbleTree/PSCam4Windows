@@ -1,0 +1,109 @@
+#include "Settings.h"
+#include <windows.h>
+
+namespace
+{
+
+bool ReadDword(HKEY key, const wchar_t* name, uint32_t* out)
+{
+    DWORD value = 0, size = sizeof(value), type = 0;
+    if (RegQueryValueExW(key, name, nullptr, &type,
+                         reinterpret_cast<BYTE*>(&value), &size) != ERROR_SUCCESS ||
+        type != REG_DWORD)
+        return false;
+    *out = value;
+    return true;
+}
+
+bool ReadBool(HKEY key, const wchar_t* name, bool* out)
+{
+    uint32_t v;
+    if (!ReadDword(key, name, &v))
+        return false;
+    *out = v != 0;
+    return true;
+}
+
+void WriteDword(HKEY key, const wchar_t* name, uint32_t value)
+{
+    RegSetValueExW(key, name, 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&value), sizeof(value));
+}
+
+uint32_t Clamp(uint32_t v, uint32_t lo, uint32_t hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+} // namespace
+
+namespace settings
+{
+
+int FindModeIndex(uint32_t w, uint32_t h, uint32_t fps)
+{
+    for (int i = 0; i < kVideoModeCount; ++i)
+        if (kVideoModes[i].width == w && kVideoModes[i].height == h && kVideoModes[i].fps == fps)
+            return i;
+    return -1;
+}
+
+Settings Load()
+{
+    Settings s;  // struct defaults
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return s;
+
+    ReadDword(key, L"Width",    &s.width);
+    ReadDword(key, L"Height",   &s.height);
+    ReadDword(key, L"Fps",      &s.fps);
+    ReadBool (key, L"FlipH",    &s.flipH);
+    ReadBool (key, L"FlipV",    &s.flipV);
+    ReadBool (key, L"AutoGain", &s.autoGain);
+    ReadDword(key, L"Gain",     &s.gain);
+    ReadDword(key, L"Exposure", &s.exposure);
+    ReadBool (key, L"AutoWhiteBalance", &s.autoWhiteBalance);
+    ReadDword(key, L"IdleTimeoutMs",    &s.idleTimeoutMs);
+    RegCloseKey(key);
+
+    // Sanitize: unknown mode -> default; ranges clamped.
+    if (FindModeIndex(s.width, s.height, s.fps) < 0)
+    {
+        const VideoMode& def = kVideoModes[kDefaultModeIndex];
+        s.width = def.width; s.height = def.height; s.fps = def.fps;
+    }
+    s.gain     = Clamp(s.gain, 0, 63);
+    s.exposure = Clamp(s.exposure, 0, 255);
+    s.idleTimeoutMs = Clamp(s.idleTimeoutMs, 1000, 60000);
+    return s;
+}
+
+bool Save(const Settings& s)
+{
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kRegPath, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return false;
+    WriteDword(key, L"Width",    s.width);
+    WriteDword(key, L"Height",   s.height);
+    WriteDword(key, L"Fps",      s.fps);
+    WriteDword(key, L"FlipH",    s.flipH ? 1 : 0);
+    WriteDword(key, L"FlipV",    s.flipV ? 1 : 0);
+    WriteDword(key, L"AutoGain", s.autoGain ? 1 : 0);
+    WriteDword(key, L"Gain",     s.gain);
+    WriteDword(key, L"Exposure", s.exposure);
+    WriteDword(key, L"AutoWhiteBalance", s.autoWhiteBalance ? 1 : 0);
+    WriteDword(key, L"IdleTimeoutMs",    s.idleTimeoutMs);
+    RegCloseKey(key);
+    return true;
+}
+
+void SeedDefaults()
+{
+    // Load() falls back to defaults for anything missing; writing the merge
+    // back persists defaults without clobbering existing user values.
+    Save(Load());
+}
+
+} // namespace settings
