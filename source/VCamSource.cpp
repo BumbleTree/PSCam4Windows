@@ -26,31 +26,131 @@ MediaStream::MediaStream(MediaSource* parent) : _parent(parent)
     DllAddRef();
 }
 
+namespace
+{
+
+void UpscaleNv12_2x(const uint8_t* src, uint8_t* dst, uint32_t srcW, uint32_t srcH)
+{
+    const uint8_t* srcY = src;
+    const uint8_t* srcUV = src + srcW * srcH;
+    
+    uint8_t* dstY = dst;
+    uint8_t* dstUV = dst + srcW * 2 * srcH * 2;
+    
+    // 1. Upscale Y plane (320x240 -> 640x480)
+    for (uint32_t y = 0; y < srcH; ++y)
+    {
+        const uint8_t* srcRow = srcY + y * srcW;
+        uint8_t* dstRow0 = dstY + (y * 2) * (srcW * 2);
+        uint8_t* dstRow1 = dstRow0 + (srcW * 2);
+        
+        for (uint32_t x = 0; x < srcW; ++x)
+        {
+            uint8_t val = srcRow[x];
+            dstRow0[x * 2]     = val;
+            dstRow0[x * 2 + 1] = val;
+            dstRow1[x * 2]     = val;
+            dstRow1[x * 2 + 1] = val;
+        }
+    }
+    
+    // 2. Upscale UV plane (320x120 -> 640x240)
+    for (uint32_t y = 0; y < srcH / 2; ++y)
+    {
+        const uint8_t* srcRowUV = srcUV + y * srcW;
+        uint8_t* dstRowUV0 = dstUV + (y * 2) * (srcW * 2);
+        uint8_t* dstRowUV1 = dstRowUV0 + (srcW * 2);
+        
+        for (uint32_t x = 0; x < srcW / 2; ++x)
+        {
+            uint8_t u = srcRowUV[x * 2];
+            uint8_t v = srcRowUV[x * 2 + 1];
+            
+            dstRowUV0[x * 4]     = u;
+            dstRowUV0[x * 4 + 1] = v;
+            dstRowUV0[x * 4 + 2] = u;
+            dstRowUV0[x * 4 + 3] = v;
+            
+            dstRowUV1[x * 4]     = u;
+            dstRowUV1[x * 4 + 1] = v;
+            dstRowUV1[x * 4 + 2] = u;
+            dstRowUV1[x * 4 + 3] = v;
+        }
+    }
+}
+
+void DownscaleNv12_2x(const uint8_t* src, uint8_t* dst, uint32_t srcW, uint32_t srcH)
+{
+    const uint8_t* srcY = src;
+    const uint8_t* srcUV = src + srcW * srcH;
+    
+    uint8_t* dstY = dst;
+    uint8_t* dstUV = dst + (srcW / 2) * (srcH / 2);
+    
+    // 1. Downscale Y plane (640x480 -> 320x240)
+    for (uint32_t y = 0; y < srcH / 2; ++y)
+    {
+        const uint8_t* srcRow = srcY + (y * 2) * srcW;
+        uint8_t* dstRow = dstY + y * (srcW / 2);
+        
+        for (uint32_t x = 0; x < srcW / 2; ++x)
+        {
+            dstRow[x] = srcRow[x * 2];
+        }
+    }
+    
+    // 2. Downscale UV plane (640x240 -> 320x120)
+    for (uint32_t y = 0; y < srcH / 4; ++y)
+    {
+        const uint8_t* srcRowUV = srcUV + (y * 2) * srcW;
+        uint8_t* dstRowUV = dstUV + y * (srcW / 2);
+        
+        for (uint32_t x = 0; x < srcW / 4; ++x)
+        {
+            dstRowUV[x * 2]     = srcRowUV[x * 4];
+            dstRowUV[x * 2 + 1] = srcRowUV[x * 4 + 1];
+        }
+    }
+}
+
+} // namespace
+
 HRESULT MediaStream::Initialize()
 {
     // The host publishes the FrameBus before registering the virtual camera,
     // so normally the real capture format is already known here. The fallback
     // only triggers if the source is activated while the host is not running.
     framebus::Header fmt{};
+    uint32_t defaultWidth = 640, defaultHeight = 480;
+    uint32_t defaultFpsNum = 60, defaultFpsDen = 1;
     if (_bus.TryOpen() && _bus.ReadFormat(fmt))
     {
-        _width = fmt.width;
-        _height = fmt.height;
-        _fpsNum = fmt.fpsNum;
-        _fpsDen = fmt.fpsDen;
-        VCamTrace(L"stream: FrameBus format %ux%u @ %u/%u", _width, _height, _fpsNum, _fpsDen);
+        defaultWidth = fmt.width;
+        defaultHeight = fmt.height;
+        defaultFpsNum = fmt.fpsNum;
+        defaultFpsDen = fmt.fpsDen;
+        VCamTrace(L"stream: FrameBus default format %ux%u @ %u/%u", defaultWidth, defaultHeight, defaultFpsNum, defaultFpsDen);
     }
     else
     {
         VCamTrace(L"stream: FrameBus not available, defaulting to 640x480@60");
     }
 
+    _width = defaultWidth;
+    _height = defaultHeight;
+    _fpsNum = defaultFpsNum;
+    _fpsDen = defaultFpsDen;
     _frameBytes = framebus::Nv12Bytes(_width, _height);
     _frameDuration = MulDiv(10000000, _fpsDen, _fpsNum);
+
     _staging.reset(new (std::nothrow) uint8_t[_frameBytes]);
     if (!_staging)
         return E_OUTOFMEMORY;
     FillBlack();
+
+    _busStaging.reset(new (std::nothrow) uint8_t[framebus::kMaxFrameBytes]);
+    if (!_busStaging)
+        return E_OUTOFMEMORY;
 
     HRESULT hr = MFCreateEventQueue(&_queue);
     if (FAILED(hr)) return hr;
@@ -62,25 +162,55 @@ HRESULT MediaStream::Initialize()
     _attributes->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
     _attributes->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, kFrameSourceTypeColor);
 
-    ComPtr<IMFMediaType> mediaType;
-    hr = CreateMediaType(&mediaType);
-    if (FAILED(hr)) return hr;
+    std::vector<IMFMediaType*> typesList;
+    ComPtr<IMFMediaType> defaultType;
 
-    IMFMediaType* types[] = { mediaType.Get() };
-    hr = MFCreateStreamDescriptor(0, 1, types, &_descriptor);
+    for (int i = 0; i < kVideoModeCount; ++i)
+    {
+        ComPtr<IMFMediaType> mt;
+        hr = CreateMediaType(kVideoModes[i].width, kVideoModes[i].height, kVideoModes[i].fps, 1, &mt);
+        if (SUCCEEDED(hr))
+        {
+            typesList.push_back(mt.Get());
+            mt->AddRef();
+
+            if (kVideoModes[i].width == defaultWidth &&
+                kVideoModes[i].height == defaultHeight &&
+                kVideoModes[i].fps == defaultFpsNum)
+            {
+                defaultType = mt;
+            }
+        }
+    }
+
+    if (typesList.empty())
+        return E_FAIL;
+
+    if (!defaultType)
+    {
+        defaultType = typesList[0];
+    }
+
+    hr = MFCreateStreamDescriptor(0, static_cast<DWORD>(typesList.size()), typesList.data(), &_descriptor);
+
+    for (auto* mt : typesList)
+    {
+        mt->Release();
+    }
+
     if (FAILED(hr)) return hr;
 
     ComPtr<IMFMediaTypeHandler> handler;
     hr = _descriptor->GetMediaTypeHandler(&handler);
     if (FAILED(hr)) return hr;
-    hr = handler->SetCurrentMediaType(mediaType.Get());
+    hr = handler->SetCurrentMediaType(defaultType.Get());
     if (FAILED(hr)) return hr;
 
     _parentRef = static_cast<IMFMediaSourceEx*>(_parent);
     return S_OK;
 }
 
-HRESULT MediaStream::CreateMediaType(IMFMediaType** ppType)
+HRESULT MediaStream::CreateMediaType(uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen, IMFMediaType** ppType)
 {
     ComPtr<IMFMediaType> mt;
     HRESULT hr = MFCreateMediaType(&mt);
@@ -88,14 +218,14 @@ HRESULT MediaStream::CreateMediaType(IMFMediaType** ppType)
 
     mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    MFSetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, _width, _height);
-    MFSetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, _fpsNum, _fpsDen);
+    MFSetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, width, height);
+    MFSetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, fpsNum, fpsDen);
     MFSetAttributeRatio(mt.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     mt->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
     mt->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
-    mt->SetUINT32(MF_MT_SAMPLE_SIZE, _frameBytes);
-    mt->SetUINT32(MF_MT_DEFAULT_STRIDE, _width);
+    mt->SetUINT32(MF_MT_SAMPLE_SIZE, framebus::Nv12Bytes(width, height));
+    mt->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
 
     *ppType = mt.Detach();
     return S_OK;
@@ -138,6 +268,25 @@ HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
         return MF_E_SHUTDOWN;
     _state = MF_STREAM_STATE_RUNNING;
     _lastFrameId = 0;  // re-sync with whatever the bus currently holds
+
+    ComPtr<IMFMediaTypeHandler> handler;
+    if (SUCCEEDED(_descriptor->GetMediaTypeHandler(&handler)))
+    {
+        ComPtr<IMFMediaType> currentType;
+        if (SUCCEEDED(handler->GetCurrentMediaType(&currentType)))
+        {
+            MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &_width, &_height);
+            MFGetAttributeRatio(currentType.Get(), MF_MT_FRAME_RATE, &_fpsNum, &_fpsDen);
+            _frameBytes = framebus::Nv12Bytes(_width, _height);
+            _frameDuration = MulDiv(10000000, _fpsDen, _fpsNum);
+            _staging.reset(new (std::nothrow) uint8_t[_frameBytes]);
+            if (!_staging)
+                return E_OUTOFMEMORY;
+            FillBlack();
+            VCamTrace(L"stream: start with format %ux%u @ %u/%u", _width, _height, _fpsNum, _fpsDen);
+        }
+    }
+
     PingActivity(true);
     VCamTrace(L"stream: started");
     return _queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, startPosition);
@@ -311,11 +460,36 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         }
         else
         {
-            const LONG64 id = _bus.TryReadNewer(_staging.get(), _frameBytes, _lastFrameId);
-            if (id != 0)
+            framebus::Header fmt{};
+            if (_bus.ReadFormat(fmt))
             {
-                _lastFrameId = id;
-                break;
+                const uint32_t busWidth = fmt.width;
+                const uint32_t busHeight = fmt.height;
+                const uint32_t busFrameBytes = framebus::Nv12Bytes(busWidth, busHeight);
+                
+                const LONG64 id = _bus.TryReadNewer(_busStaging.get(), busFrameBytes, _lastFrameId);
+                if (id != 0)
+                {
+                    _lastFrameId = id;
+                    
+                    if (busWidth == _width && busHeight == _height)
+                    {
+                        memcpy(_staging.get(), _busStaging.get(), _frameBytes);
+                    }
+                    else if (busWidth == 320 && busHeight == 240 && _width == 640 && _height == 480)
+                    {
+                        UpscaleNv12_2x(_busStaging.get(), _staging.get(), 320, 240);
+                    }
+                    else if (busWidth == 640 && busHeight == 480 && _width == 320 && _height == 240)
+                    {
+                        DownscaleNv12_2x(_busStaging.get(), _staging.get(), 640, 480);
+                    }
+                    else
+                    {
+                        FillBlack();
+                    }
+                    break;
+                }
             }
         }
         if (GetTickCount64() >= deadline)
