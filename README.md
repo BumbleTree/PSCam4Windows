@@ -2,7 +2,7 @@
 
 This project allows you to use your classic PlayStation 3 Eye camera and its built-in microphone array as a standard web camera and audio input device on modern Windows 11 systems. 
 
-Once installed, the PS3 Eye appears to apps like **Discord, Zoom, OBS, RPCS3 (PS3 Emulator), and web browsers** as a regular built-in camera called **"PS3 Eye (Windows Virtual Camera)"**, and its integrated 4-channel microphone array is exposed as a standard recording device named **"PS3 Eye Camera"**. It operates entirely in user space (no risky kernel drivers) and is fully safe for Memory Integrity / Core Isolation settings.
+Once installed, the PS3 Eye appears to apps like **Discord, Zoom, OBS, RPCS3 (PS3 Emulator), and web browsers** as a regular built-in camera called **"PS3 Eye (Windows Virtual Camera)"**, and its integrated 4-channel microphone array is exposed as a standard recording device named **"USB Camera-B4.09.24.1"**. It operates entirely in user space (no risky kernel drivers) and is fully safe for Memory Integrity / Core Isolation settings.
 
 ```
                               ┌── Interface 0 (MI_00) ── WinUSB ── libusb ── PS3EYEDriver ──► PS3EyeVCamTray.exe
@@ -16,7 +16,7 @@ PS3 Eye (Composite Device) ───┤                                         
                               │                                                                 ▼
                               │                                             "PS3 Eye (Windows Virtual Camera)" in every app
                               │
-                              └── Interface 1 (MI_01) ── usbaudio.sys ──► "PS3 Eye Camera" (Microphone) in every app
+                              └── Interface 1 (MI_01) ── usbaudio.sys ──► "USB Camera-B4.09.24.1" (Microphone) in every app
 ```
 
 ---
@@ -24,11 +24,11 @@ PS3 Eye (Composite Device) ───┤                                         
 ## What It Does For You
 
 * **Automatic Sleep & Wake:** The camera only turns on when a program is actually using it. The physical camera is powered down (0% CPU, LED off) when not in use. It wakes up in under a second when needed.
-* **Built-in Microphone Array Support:** Automatically installs a custom audio driver configuration that exposes the PS3 Eye's high-quality microphone array as a standard Windows audio input device (**"PS3 Eye Camera"**), working seamlessly out-of-the-box.
+* **Built-in Microphone Array Support:** Exposes the PS3 Eye's high-quality 4-channel microphone array as a standard Windows audio input device (**"USB Camera-B4.09.24.1"**) using Windows' native USB Audio Class driver, working seamlessly out-of-the-box.
 * **Easy Access Settings:** Control camera settings directly from a system tray icon.
 * **Settings Persistence:** Mirroring, gain, exposure, and white balance settings are saved and remembered automatically.
 * **Automatic Silent Start:** Starts automatically when you sign into Windows without triggering any popups (UAC prompt-free).
-* **Zero Driver Hassles:** No need to download Zadig or other custom installer programs. The installation script handles the entire driver setup automatically for both video and audio.
+* **Zero Driver Hassles:** No need to download Zadig or other custom installer programs. The installation script handles the entire video driver setup automatically.
 
 ---
 
@@ -39,7 +39,7 @@ PS3 Eye (Composite Device) ───┤                                         
 2. Right-click [install.bat] and choose **Run as administrator** (or double-click it and accept the prompt).
 3. The installer will:
    * Copy files to `C:\Program Files\PS3EyeVCam` (required for system camera integration).
-   * Install the necessary WinUSB video and USB audio drivers automatically.
+   * Install the necessary WinUSB video driver automatically.
    * Register the Virtual Camera DLL.
    * Set up a silent logon task to launch the control tray app at Windows startup.
    * Launch the system tray controller.
@@ -47,7 +47,7 @@ PS3 Eye (Composite Device) ───┤                                         
 ### Uninstallation
 If you want to cleanly remove it from your system:
 1. Double-click [uninstall.bat] (or run the copy inside `C:\Program Files\PS3EyeVCam`).
-2. It will stop the services, delete scheduled tasks, remove registry entries, remove the video and audio drivers, and delete all copied files.
+2. It will stop the services, delete scheduled tasks, remove registry entries, remove the video driver, and delete all copied files.
 
 ---
 
@@ -76,7 +76,7 @@ Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray
 2. Open **RPCS3** and go to **Settings** > **I/O**.
 3. Set **Camera Handler** to **Qt** and select **PS3 Eye (Windows Virtual Camera)** as the device.
 4. Ensure camera access is allowed under Windows Settings (*Privacy & security* > *Camera* > *Allow desktop apps to access your camera*).
-5. For microphone support in RPCS3, go to **Settings** > **Audio**, configure your microphone handler (e.g., **USBD** or standard Windows audio input), and select the **PS3 Eye Camera** as the recording device.
+5. For microphone support in RPCS3, go to **Settings** > **Audio**, configure your microphone handler (e.g., **USBD** or standard Windows audio input), and select the **USB Camera-B4.09.24.1** as the recording device.
 
 ---
 
@@ -93,7 +93,7 @@ Once installed, look for the **PS3 Eye camera icon** in your Windows System Tray
 
 ## Architecture & Technical Notes (For Developers)
 
-* The PS3 Eye is a composite USB device. Interface 0 (`MI_00`) handles video streaming via WinUSB and the tray app, while Interface 1 (`MI_01`) is mapped to the standard Windows USB Audio Class driver (`usbaudio.sys`) via a custom INF to expose the 4-channel microphone array.
+* The PS3 Eye is a composite USB device. Interface 0 (`MI_00`) handles video streaming via WinUSB and the tray app, while Interface 1 (`MI_01`) is automatically mapped to standard Windows USB Audio (`usbaudio.sys`) to expose the 4-channel microphone array.
 * The virtual camera media source DLL (`PS3EyeVCam.dll`) runs inside the **Camera Frame Server service** (`LOCAL SERVICE`).
 * Video frames are written by the tray app and read by the DLL via a high-performance lock-free shared memory queue (`Global\PS3EyeVCam.FrameBus`).
 * Sleep/wake state is coordinated via a shared keepalive timestamp (`common\ControlBus.h`). If the virtual camera DLL stops requesting frames, the tray app puts the hardware to sleep after ~3 seconds.

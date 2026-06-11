@@ -42,11 +42,19 @@ if exist "%DEST%\PS3EyeVCam.dll" (
 echo Deleting registry settings...
 reg delete "HKLM\SOFTWARE\PS3EyeVCam" /f >nul 2>&1
 
-echo Removing Video and Audio Drivers...
-powershell -Command "$oem = Get-WindowsDriver -Online | Where-Object { $_.OriginalFileName -like '*usb_device.inf' -or $_.OriginalFileName -like '*usb_audio.inf' } | Select-Object -ExpandProperty Driver; if ($oem) { foreach ($d in $oem) { pnputil /delete-driver $d /uninstall /force } }" >nul 2>&1
+echo Removing Video Driver...
+powershell -Command "$oem = Get-WindowsDriver -Online | Where-Object { $_.OriginalFileName -like '*usb_device.inf' } | Select-Object -ExpandProperty Driver; if ($oem) { pnputil /delete-driver $oem /uninstall /force }" >nul 2>&1
 
 
 echo Removing WinUSB Driver Certificate...
+if exist "%DEST%\driver\usb_device.cer" (
+    for /f "tokens=*" %%a in ('powershell -Command "Get-PfxCertificate -FilePath '%DEST%\driver\usb_device.cer' | Select-Object -ExpandProperty Thumbprint"') do (
+        certutil -delstore "Root" "%%a" >nul 2>&1
+        certutil -delstore "TrustedPublisher" "%%a" >nul 2>&1
+    )
+)
+certutil -delstore "Root" "7512009F4ABF479DB61559810A5B1DE9C8007723" >nul 2>&1
+certutil -delstore "TrustedPublisher" "7512009F4ABF479DB61559810A5B1DE9C8007723" >nul 2>&1
 certutil -delstore "Root" "d0a3c5233b11288afa8d6924949d985988b536f6" >nul 2>&1
 certutil -delstore "TrustedPublisher" "d0a3c5233b11288afa8d6924949d985988b536f6" >nul 2>&1
 
