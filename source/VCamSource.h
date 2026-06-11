@@ -21,6 +21,8 @@
 #include "../common/VCamGuids.h"
 #include "../common/FrameBus.h"
 #include "../common/ControlBus.h"
+#include "../common/Settings.h"
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -126,7 +128,7 @@ public:
     STDMETHODIMP KsEvent(void*, ULONG, void*, ULONG, ULONG*) override;
 
 private:
-    HRESULT CreateMediaType(IMFMediaType** ppType);
+    HRESULT CreateMediaType(uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen, IMFMediaType** ppType);
     HRESULT DeliverSample(IUnknown* token);
     void    FillBlack();
     void    PingActivity(bool forceWakeSignal);  // caller must hold _lock
@@ -152,6 +154,7 @@ private:
     ULONGLONG                  _nextBusRetryTick = 0;
     LONG64                     _lastFrameId = 0;
     std::unique_ptr<uint8_t[]> _staging;   // last good frame (starts black)
+    std::unique_ptr<uint8_t[]> _busStaging; // temp buffer for reading raw frames from the bus
 
     // Sleep/wake keepalive towards the host. Closed by the destructor, not by
     // Shutdown (same in-flight-call rationale as _bus).
