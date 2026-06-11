@@ -42,12 +42,13 @@ if exist "%DEST%\PS3EyeVCam.dll" (
 echo Deleting registry settings...
 reg delete "HKLM\SOFTWARE\PS3EyeVCam" /f >nul 2>&1
 
-echo Removing WinUSB Driver...
-powershell -Command "$oem = Get-WindowsDriver -Online | Where-Object { $_.OriginalFileName -like '*usb_device.inf' } | Select-Object -ExpandProperty Driver; if ($oem) { pnputil /delete-driver $oem /uninstall /force }" >nul 2>&1
+echo Removing Video and Audio Drivers...
+powershell -Command "$oem = Get-WindowsDriver -Online | Where-Object { $_.OriginalFileName -like '*usb_device.inf' -or $_.OriginalFileName -like '*usb_audio.inf' } | Select-Object -ExpandProperty Driver; if ($oem) { foreach ($d in $oem) { pnputil /delete-driver $d /uninstall /force } }" >nul 2>&1
+
 
 echo Removing WinUSB Driver Certificate...
-certutil -delstore "Root" "026c76943f949bf21f009db1e8e4fc3be3ad7209" >nul 2>&1
-certutil -delstore "TrustedPublisher" "026c76943f949bf21f009db1e8e4fc3be3ad7209" >nul 2>&1
+certutil -delstore "Root" "d0a3c5233b11288afa8d6924949d985988b536f6" >nul 2>&1
+certutil -delstore "TrustedPublisher" "d0a3c5233b11288afa8d6924949d985988b536f6" >nul 2>&1
 
 echo Cleaning up files...
 if exist "%DEST%" (

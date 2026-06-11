@@ -82,6 +82,18 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+copy /y "%~dp0driver\usb_audio.inf" "%DEST%\driver\" >nul
+if errorlevel 1 (
+    echo error: could not copy usb_audio.inf
+    pause
+    exit /b 1
+)
+copy /y "%~dp0driver\usb_audio.cat" "%DEST%\driver\" >nul
+if errorlevel 1 (
+    echo error: could not copy usb_audio.cat
+    pause
+    exit /b 1
+)
 copy /y "%~dp0driver\amd64\WdfCoInstaller01011.dll" "%DEST%\driver\amd64\" >nul
 if errorlevel 1 (
     echo error: could not copy WdfCoInstaller01011.dll
@@ -107,8 +119,13 @@ echo Registering WinUSB Driver Certificate...
 certutil -addstore "Root" "%DEST%\driver\usb_device.cer" >nul 2>&1
 certutil -addstore "TrustedPublisher" "%DEST%\driver\usb_device.cer" >nul 2>&1
 
-echo Installing WinUSB Driver...
+echo Installing WinUSB Video Driver...
 pnputil /add-driver "%DEST%\driver\usb_device.inf" /install >nul 2>&1
+
+echo Installing custom PS3 Eye Audio Driver...
+pnputil /add-driver "%DEST%\driver\usb_audio.inf" /install >nul 2>&1
+
+
 
 
 echo Writing default registry settings (Highest Resolution: 640x480@60)...
