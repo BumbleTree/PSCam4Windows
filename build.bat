@@ -41,16 +41,19 @@ if errorlevel 1 exit /b 1
 
 echo === compiling PS3EyeVCamTray.exe ===
 set HOSTFLAGS=%CFLAGS% /I "%ROOT%third_party\ps3eye" /I "%DS%\libusb\libusb"
-cl %HOSTFLAGS% "%ROOT%host\Main.cpp"              /Fo"%OUT%\Main.obj"              || exit /b 1
-cl %HOSTFLAGS% "%ROOT%host\CaptureController.cpp" /Fo"%OUT%\CaptureController.obj" || exit /b 1
-cl %HOSTFLAGS% "%ROOT%host\TrayUI.cpp"            /Fo"%OUT%\TrayUI.obj"            || exit /b 1
-cl %HOSTFLAGS% "%ROOT%host\SettingsDialog.cpp"    /Fo"%OUT%\SettingsDialog.obj"    || exit /b 1
-cl %HOSTFLAGS% "%ROOT%host\Autostart.cpp"         /Fo"%OUT%\Autostart.obj"         || exit /b 1
-cl %HOSTFLAGS% "%ROOT%common\Settings.cpp"        /Fo"%OUT%\Settings.obj"          || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\Main.cpp"                /Fo"%OUT%\Main.obj"                || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\CaptureController.cpp"   /Fo"%OUT%\CaptureController.obj"   || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\TrayUI.cpp"              /Fo"%OUT%\TrayUI.obj"              || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\SettingsDialog.cpp"      /Fo"%OUT%\SettingsDialog.obj"      || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\CameraPreview.cpp"       /Fo"%OUT%\CameraPreview.obj"       || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\Ps3EyePreviewSource.cpp" /Fo"%OUT%\Ps3EyePreviewSource.obj" || exit /b 1
+cl %HOSTFLAGS% "%ROOT%host\Autostart.cpp"           /Fo"%OUT%\Autostart.obj"           || exit /b 1
+cl %HOSTFLAGS% "%ROOT%common\Settings.cpp"          /Fo"%OUT%\Settings.obj"            || exit /b 1
 
 link /nologo /SUBSYSTEM:WINDOWS /OUT:"%OUT%\PS3EyeVCamTray.exe" ^
     "%OUT%\Main.obj" "%OUT%\CaptureController.obj" "%OUT%\TrayUI.obj" ^
-    "%OUT%\SettingsDialog.obj" "%OUT%\Autostart.obj" "%OUT%\Settings.obj" ^
+    "%OUT%\SettingsDialog.obj" "%OUT%\CameraPreview.obj" "%OUT%\Ps3EyePreviewSource.obj" ^
+    "%OUT%\Autostart.obj" "%OUT%\Settings.obj" ^
     "%OUT%\ps3eye.obj" "%OUT%\app.res" ^
     "%DS%\libusb\x64\Release\lib\libusb-1.0.lib" ^
     mfplat.lib mfuuid.lib ole32.lib oleaut32.lib advapi32.lib setupapi.lib ^

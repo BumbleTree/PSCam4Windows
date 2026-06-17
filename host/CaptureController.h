@@ -59,6 +59,25 @@ public:
     uint32_t MeasuredFpsX10() const { return _fpsX10.load(std::memory_order_relaxed); }
     Settings ActiveSettings() const;
 
+    // In-process request from the Settings dialog preview to keep the camera
+    // streaming while the dialog is open, independent of the ControlBus
+    // keepalive (which only fires when an external app consumes frames).
+    // Cleared on dialog close. Does not touch the ControlBus protocol.
+    // Turning hold on pokes the camera thread so an Asleep controller
+    // re-evaluates clientFresh() immediately instead of waiting for the next
+    // external wake.
+    void SetPreviewHold(bool held);
+
+    // True when the preview dialog is the only thing keeping this camera
+    // streaming (preview-hold on, no external client has a fresh keepalive).
+    // Used to suppress the "mode change queued" balloon — the mode applies
+    // immediately when the preview is the only consumer.
+    bool IsPreviewOnly() const
+    {
+        return _previewHold.load(std::memory_order_relaxed) &&
+               !_externalClient.load(std::memory_order_relaxed);
+    }
+
 private:
     static DWORD WINAPI ThreadProc(LPVOID self);
     void Run();
@@ -79,6 +98,8 @@ private:
     std::atomic<State>    _state{ State::Starting };
     std::atomic<bool>     _settingsDirty{ false };
     std::atomic<bool>     _pendingMode{ false };
+    std::atomic<bool>     _previewHold{ false };
+    std::atomic<bool>     _externalClient{ false };  // fresh ControlBus keepalive
     std::atomic<uint32_t> _fpsX10{ 0 };
 };
 

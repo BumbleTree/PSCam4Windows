@@ -4,7 +4,7 @@
 // First icon in the file is what Explorer shows for the exe.
 IDI_APP ICON "PS3EyeVCam.ico"
 
-IDD_SETTINGS DIALOGEX 0, 0, 232, 290
+IDD_SETTINGS DIALOGEX 0, 0, 460, 290
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "PS3 Eye Camera"
@@ -51,9 +51,13 @@ BEGIN
 
     AUTOCHECKBOX    "&Start with Windows", IDC_AUTOSTART, 12, 195, 120, 10
 
-    LTEXT           "", IDC_STATUS_TEXT, 12, 216, 208, 30
+    LTEXT           "", IDC_STATUS_TEXT, 12, 216, 436, 30
+
+    CONTROL         "", IDC_PREVIEW, "Static", SS_SUNKEN | WS_CHILD | WS_VISIBLE,
+                    240, 11, 208, 157
+
     PUSHBUTTON      "Reset &defaults", IDC_RESET, 12, 268, 72, 14
-    DEFPUSHBUTTON   "Close", IDOK, 170, 268, 50, 14
+    DEFPUSHBUTTON   "Close", IDOK, 398, 268, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

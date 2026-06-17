@@ -25,6 +25,7 @@
 #define IDC_GREEN_LABEL       226
 #define IDC_TESTPATTERN       227
 #define IDC_RESET             229
+#define IDC_PREVIEW           230
 
 // Tray menu commands (menu built dynamically)
 #define IDM_SETTINGS        300

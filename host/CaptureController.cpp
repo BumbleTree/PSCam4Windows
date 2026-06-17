@@ -137,6 +137,18 @@ Settings CaptureController::ActiveSettings() const
     return s;
 }
 
+void CaptureController::SetPreviewHold(bool held)
+{
+    _previewHold.store(held, std::memory_order_relaxed);
+    // Turning hold on must wake an Asleep controller so it re-evaluates
+    // clientFresh() immediately; otherwise it stays parked in
+    // WaitForMultipleObjects until some external event arrives. Turning hold
+    // off needs no nudge: the next stale-keepalive check puts the camera back
+    // to sleep on its own.
+    if (held && _cmdEvent)
+        SetEvent(_cmdEvent);
+}
+
 void CaptureController::SetState(State s)
 {
     if (_state.exchange(s, std::memory_order_relaxed) != s && _notifyWnd)
@@ -241,6 +253,16 @@ void CaptureController::Run()
     // getFrame writes publish-ready YUY2 straight into this buffer (the
     // Bayer->YUY2 debayer is fused inside the driver; no RGB intermediate).
     std::unique_ptr<uint8_t[]> yuy2(new uint8_t[framebus::kMaxFrameBytes]);
+
+    // True while either (a) an external app is consuming frames (ControlBus
+    // keepalive fresh) or (b) the Settings dialog preview is open for this
+    // camera. Both keep the Streaming phase alive; neither touches the wire
+    // protocol — previewHold is an in-process tray signal only.
+    auto clientFresh = [&]() {
+        const bool ext = control.ActivityAgeMs() < active.idleTimeoutMs;
+        _externalClient.store(ext, std::memory_order_relaxed);
+        return ext || _previewHold.load(std::memory_order_relaxed);
+    };
 
     // True while a physical PS3 Eye occupies this slot. Refreshes the global
     // slot map (cheap libusb descriptor walk; only runs while not streaming).
@@ -395,7 +417,7 @@ void CaptureController::Run()
                     unregisterVCam();
             }
 
-            if (vcamLive && control.ActivityAgeMs() < active.idleTimeoutMs)
+            if (vcamLive && clientFresh())
             {
                 phase = Phase::Waking;
                 break;
@@ -426,7 +448,7 @@ void CaptureController::Run()
         {
             drainSettings(false);
             applyPendingMode();
-            if (control.ActivityAgeMs() >= active.idleTimeoutMs)
+            if (!clientFresh())
             {
                 phase = Phase::Asleep;  // client went away while we were down
                 break;
@@ -493,9 +515,22 @@ void CaptureController::Run()
 
             drainSettings(true);
 
-            if (control.ActivityAgeMs() >= active.idleTimeoutMs)
+            // Go to sleep when there are no clients, OR when the preview is
+            // the only consumer and a mode change is pending (applying it
+            // requires releasing the camera; preview-hold re-wakes it
+            // immediately afterwards with the new format).
+            const bool previewOnlyModeChange =
+                _pendingMode.load(std::memory_order_relaxed) &&
+                IsPreviewOnly();
+
+            if (previewOnlyModeChange || !clientFresh())
             {
-                HostLog(L"camera %d: no clients for %ums -- going to sleep", _cameraIndex, active.idleTimeoutMs);
+                if (previewOnlyModeChange)
+                    HostLog(L"camera %d: applying pending mode change for preview",
+                            _cameraIndex);
+                else
+                    HostLog(L"camera %d: no clients for %ums and preview closed -- going to sleep",
+                            _cameraIndex, active.idleTimeoutMs);
                 releaseCamera();
                 bus.PublishBlack();
                 applyPendingMode();

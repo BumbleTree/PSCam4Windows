@@ -1493,11 +1493,15 @@ bool PS3EYECam::start()
 
 	setAutogain(autogain);
 	setAutoWhiteBalance(awb);
-	setGain(gain);
-	setExposure(exposure);
-	setRedBalance(redblc);
-	setBlueBalance(blueblc);
-	setGreenBalance(greenblc);
+	if (!autogain) {
+		setGain(gain);
+		setExposure(exposure);
+	}
+	if (!awb) {
+		setRedBalance(redblc);
+		setBlueBalance(blueblc);
+		setGreenBalance(greenblc);
+	}
     setFlip(flip_h, flip_v);
 
 	ov534_set_led(1);

@@ -167,4 +167,37 @@ private:
     Header* _view = nullptr;
 };
 
+// -------------------------------------------------------- ActivityAge --------
+// Read-only query for callers (the preview UI) that need to know whether a
+// client is consuming frames but must not take a writable Host handle. Opens
+// the ControlBus section FILE_MAP_READ, reads lastActivityTick once, and
+// closes. Returns MAXULONGLONG if the section does not exist yet or has never
+// been stamped. Pure leaf, safe to call from any thread.
+inline ULONGLONG ActivityAge(int cameraIndex)
+{
+    wchar_t sectionName[64];
+    ipcnames::Format(sectionName, L".Control", cameraIndex);
+
+    HANDLE map = OpenFileMappingW(FILE_MAP_READ, FALSE, sectionName);
+    if (!map)
+        return MAXULONGLONG;
+
+    Header* view = static_cast<Header*>(
+        MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0));
+    ULONGLONG age = MAXULONGLONG;
+    if (view && view->magic == kMagic)
+    {
+        const LONG64 tick = ReadAcquire64(&view->lastActivityTick);
+        if (tick != 0)
+        {
+            const ULONGLONG now = GetTickCount64();
+            age = now > static_cast<ULONGLONG>(tick) ? now - static_cast<ULONGLONG>(tick) : 0;
+        }
+    }
+    if (view)
+        UnmapViewOfFile(view);
+    CloseHandle(map);
+    return age;
+}
+
 } // namespace controlbus

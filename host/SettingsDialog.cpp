@@ -2,9 +2,11 @@
 
 #include <commctrl.h>
 #include <cstdio>
+#include <memory>
 
 #include "TrayUI.h"
 #include "Autostart.h"
+#include "CameraPreview.h"
 #include "../common/VCamGuids.h"
 #include "../res/resource.h"
 
@@ -22,6 +24,13 @@ constexpr UINT     kPersistDelayMs = 500;
 constexpr UINT_PTR kStatusTimerId  = 2;
 
 TrayUI* g_tray = nullptr;  // for ApplySettings routing (set via Show)
+
+// Live preview widget. Constructed in WM_INITDIALOG, destroyed in WM_DESTROY.
+// While it exists it owns a worker thread that blocks on the FrameBus
+// FrameReady event and a DIB section the worker fills with converted BGRA.
+// While null (dialog closed) there is no thread and no Reader mapping — the
+// zero-overhead-when-closed guarantee.
+std::unique_ptr<CameraPreview> g_preview;
 
 Settings SnapshotFromControls(HWND dlg)
 {
@@ -114,7 +123,7 @@ void UpdateStatusText(HWND dlg)
         break;
     }
 
-    if (activeController->HasPendingModeChange())
+    if (activeController->HasPendingModeChange() && !activeController->IsPreviewOnly())
         wcscat_s(text, L"\nNew mode applies when no app is using the camera.");
 
     SetDlgItemTextW(dlg, IDC_STATUS_TEXT, text);
@@ -227,6 +236,18 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
         SendMessageW(dlg, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
         LoadControls(dlg);
         SetTimer(dlg, kStatusTimerId, 2000, nullptr);
+
+        // Spin up the live preview. The worker thread opens a read-only
+        // FrameBus mapping for the selected camera and blocks on its
+        // FrameReady event; a per-camera preview-hold atomic keeps the
+        // CaptureController streaming while the dialog is open. All of this
+        // is torn down in WM_DESTROY so nothing runs while the dialog is
+        // closed.
+        g_preview = std::make_unique<CameraPreview>();
+        g_preview->SetControllerArray(g_controller);
+        g_preview->Attach(dlg, IDC_PREVIEW, g_instance);
+        g_preview->SetCamera(g_selectedCameraIndex);  // also sets preview hold
+
         return TRUE;
     }
 
@@ -261,6 +282,12 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
                     settings::Save(g_selectedCameraIndex, SnapshotFromControls(dlg));
                 g_selectedCameraIndex = static_cast<int>(SendDlgItemMessageW(dlg, IDC_CAMCOMBO, CB_GETCURSEL, 0, 0));
                 LoadControls(dlg);
+
+                // Re-target the preview at the newly selected camera. This
+                // also toggles the per-camera preview-hold flag off on the
+                // old slot and on for the new one.
+                if (g_preview)
+                    g_preview->SetCamera(g_selectedCameraIndex);
             }
             return TRUE;
         case IDC_MODECOMBO:
@@ -312,6 +339,15 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
         KillTimer(dlg, kStatusTimerId);
         if (KillTimer(dlg, kPersistTimerId))
             settings::Save(g_selectedCameraIndex, SnapshotFromControls(dlg));
+
+        // Tear down the preview first: joins the worker thread, releases the
+        // DIB, and clears the per-camera preview-hold flag so the
+        // CaptureController can go back to sleep. After this returns there is
+        // no preview thread and no Reader mapping — the zero-overhead-when-
+        // closed guarantee.
+        if (g_preview)
+            g_preview.reset();
+
         g_dlg = nullptr;
         return TRUE;
     }

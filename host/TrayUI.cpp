@@ -187,7 +187,13 @@ void TrayUI::ApplySettings(int cameraIndex, const Settings& s, bool persistNow)
     if (persistNow)
         settings::Save(cameraIndex, s);
 
-    if (_controllers[cameraIndex].GetState() == CaptureController::State::Streaming && !s.SameMode(_controllers[cameraIndex].ActiveSettings()))
+    // The balloon only makes sense when the mode change is genuinely deferred
+    // behind a live external client. When the preview is the only consumer
+    // (or the camera isn't streaming), the mode applies immediately on the
+    // next sleep transition — no need to bother the user.
+    if (_controllers[cameraIndex].GetState() == CaptureController::State::Streaming &&
+        !s.SameMode(_controllers[cameraIndex].ActiveSettings()) &&
+        !_controllers[cameraIndex].IsPreviewOnly())
     {
         ShowBalloon(L"Mode change queued",
                     L"The new video mode will apply when no app is using the camera.");
