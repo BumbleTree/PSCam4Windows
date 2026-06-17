@@ -199,8 +199,12 @@ LRESULT CALLBACK CameraPreview::SubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPA
     {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
-        if (self) self->Paint(hdc, ps.rcPaint.right - ps.rcPaint.left,
-                                    ps.rcPaint.bottom - ps.rcPaint.top);
+        if (self)
+        {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            self->Paint(hdc, rc.right - rc.left, rc.bottom - rc.top);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -303,6 +307,7 @@ DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
     LONG64 lastFrameId = 0;
     uint32_t lastFmtW = 0, lastFmtH = 0;
     int openForCamera = -1;
+    ULONGLONG lastInUseCheck = 0;
 
     while (self->_running.load(std::memory_order_relaxed))
     {
@@ -334,6 +339,7 @@ DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
             lastFrameId = 0;          // new source — re-read current frame
             lastFmtW = lastFmtH = 0;
             self->_inUse.store(false, std::memory_order_relaxed);
+            lastInUseCheck = 0;
         }
 
         // Read format; recreate DIB if it changed.
@@ -364,8 +370,10 @@ DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
         // Refresh the in-use badge flag for the UI thread. The worker owns
         // _source; doing this here keeps Paint off _source entirely and
         // avoids opening the ControlBus section on every WM_PAINT.
-        if (self->_controllers)
+        const ULONGLONG nowTick = GetTickCount64();
+        if (self->_controllers && nowTick - lastInUseCheck >= 500)
         {
+            lastInUseCheck = nowTick;
             const uint32_t idleMs = (self->_controllers + cam)
                                         ->ActiveSettings().idleTimeoutMs;
             self->_inUse.store(self->_source->IsCameraInUse(idleMs),
