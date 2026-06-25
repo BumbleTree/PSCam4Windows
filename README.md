@@ -1,4 +1,4 @@
-# PSCam4Win — PlayStation cameras as Windows Virtual Cameras
+# PSCam4Win — PlayStation cameras as Windows Virtual Cameras (Windows 11 Only)
 
 PSCam4Win lets you use classic PlayStation cameras as standard web cameras (and audio inputs) on modern Windows 11 systems. It currently supports the **PlayStation 3 Eye** and the **PlayStation 2 EyeToy**, behind one common user-space pipeline.
 
