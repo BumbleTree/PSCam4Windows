@@ -1,7 +1,7 @@
 # Vendored libjpeg-turbo (prebuilt)
 
 This directory vendors a prebuilt **libjpeg-turbo 3.1.4** so the project stays self-contained: a
-fresh `git clone` of PS3EyeVCam builds with `build.bat` without any external dependency, exactly like
+fresh `git clone` of PSCam4Win builds with `build.bat` without any external dependency, exactly like
 the vendored `third_party/libusb`.
 
 It is used by **one consumer only**: the PS2 EyeToy transport

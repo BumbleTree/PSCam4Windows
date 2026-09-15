@@ -1,7 +1,7 @@
 # Vendored libusb (prebuilt)
 
 This directory vendors a prebuilt **libusb 1.0.27** so the project is self-contained: a fresh
-`git clone` of PS3EyeVCam builds with `build.bat` without a separate libusb checkout.
+`git clone` of PSCam4Win builds with `build.bat` without a separate libusb checkout.
 
 ## Contents
 

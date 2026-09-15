@@ -44,7 +44,7 @@ PS3 Eye (Composite Device) ───┤                                         
 ## How to Install & Uninstall
 
 ### Installation
-1. Download **`PSCam4Win-Setup.exe`** from the [latest release](../../releases/latest). The public release workflow requires SignPath signing of the installer, payload, and driver catalogs; availability depends on project approval. Check the downloaded file's Digital Signatures before running it. Local `build.bat` output is an unsigned development installer, not an equivalent signed release. See [release signing](.github/signing/README.md).
+1. Download **`PSCam4Win-Setup.exe`** from the [latest release](../../releases/latest). The public release workflow requires SignPath signing of the installer, payload, and driver catalogs; availability depends on project approval. Check the downloaded file's Digital Signatures before running it. Local `build.bat` output is an unsigned development installer, not an equivalent signed release. See [code signing policy](CODE_SIGNING.md).
 2. Double-click it and accept the elevation prompt. The setup wizard will:
    * Let you choose which camera drivers to install (PS3 Eye / PS2 EyeToy / PS4 Camera) and whether to start at logon.
    * Upgrade any older **PS3EyeVCam** install in place (migrating your saved per-camera settings, then removing the old app, task, and registration).
