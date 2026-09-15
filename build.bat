@@ -17,7 +17,8 @@ rem ---- Locate VS compiler using vswhere -------------------------------------
 set "VS_PATH="
 set "VCVARS_PATH="
 if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
-    "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%temp%\vs_path.txt" 2>nul
+    rem Include standalone Build Tools as well as full Visual Studio editions.
+    "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%temp%\vs_path.txt" 2>nul
     if exist "%temp%\vs_path.txt" (
         set /p VS_PATH=<"%temp%\vs_path.txt"
         del "%temp%\vs_path.txt"
