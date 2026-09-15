@@ -81,6 +81,7 @@ rem at it. VENDORFLAGS drops back to /W3 for third_party\ps3eye only: warnings i
 rem code we do not author are noise we cannot act on without diverging upstream.
 set CFLAGS=/nologo /c /O2 /MT /EHsc /std:c++17 /utf-8 /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
 set VENDORFLAGS=%CFLAGS:/W4=/W3%
+if "%PSCAM_PUBLIC_RELEASE%"=="1" set CFLAGS=%CFLAGS% /DPSCAM_PUBLIC_RELEASE
 
 if /i "%BUILD_MODE%"=="installer" goto installer_phase
 

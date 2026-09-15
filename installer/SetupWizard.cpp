@@ -211,11 +211,17 @@ void SetupWizard::OnInitFrame(HWND frame)
         L"for Discord, OBS, browsers, RPCS3, and everything else.\r\n\r\n"
         L"Setup will install the camera drivers you select, register the "
         L"virtual camera with Windows, and add PSCam4Win to Apps & Features.\r\n\r\n"
+#ifdef PSCAM_PUBLIC_RELEASE
+        L"The camera drivers use Microsoft's inbox WinUSB with signed catalogs. "
+        L"Setup does not add certificates to your trust stores. Windows may "
+        L"ask you to approve the driver publisher.\r\n\r\n"
+#else
         L"The camera drivers are Microsoft's own inbox WinUSB, but their INF "
         L"catalogs are self-signed. Windows will not accept a self-signed driver "
         L"package unless it trusts the signer, so setup adds each selected "
         L"package's certificate to the Trusted Root and Trusted Publishers "
         L"stores. Uninstalling removes them again.\r\n\r\n"
+#endif
         L"Windows 11 is required. Administrator rights are required.",
         L"" PSCAM_VERSION_DISPLAY);
     SetDlgItemTextW(_pages[PageWelcome], IDC_WELCOME_TEXT, text);

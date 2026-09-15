@@ -451,6 +451,7 @@ HCERTSTORE OpenSystemStore(const wchar_t* name)
                          CERT_SYSTEM_STORE_LOCAL_MACHINE, name);
 }
 
+#ifndef PSCAM_PUBLIC_RELEASE
 bool StoreContainsThumbprint(HCERTSTORE store, const BYTE thumb[20])
 {
     CRYPT_HASH_BLOB blob = { 20, const_cast<BYTE*>(thumb) };
@@ -463,11 +464,20 @@ bool StoreContainsThumbprint(HCERTSTORE store, const BYTE thumb[20])
     }
     return false;
 }
+#endif
 
 } // namespace
 
 bool AddCertToSystemStores(const BYTE* der, DWORD len, CertRecord& rec, Logger& log)
 {
+#ifdef PSCAM_PUBLIC_RELEASE
+    // Public packages rely on Windows certificate policy, never installer-added trust.
+    (void)der;
+    (void)len;
+    (void)rec;
+    log.Line(L"Public release: certificate stores are left unchanged");
+    return true;
+#else
     if (!ThumbprintOfCertBytes(der, len, rec.thumbprint))
     {
         log.Line(L"error: embedded certificate is not a valid X.509 blob");
@@ -510,6 +520,7 @@ bool AddCertToSystemStores(const BYTE* der, DWORD len, CertRecord& rec, Logger& 
             return false;
     }
     return true;
+#endif
 }
 
 bool RemoveCertByThumbprint(const BYTE thumb[20], bool fromRoot, bool fromTrustedPub, Logger& log)
