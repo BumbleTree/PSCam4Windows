@@ -1,0 +1,97 @@
+# Release pipeline: build, sign via SignPath (SignPath Foundation OSS
+# certificate), publish the signed setup exe as a GitHub Release asset.
+#
+# Two-stage signing: the payload binaries (PSCam4Win.dll, PSCam4WinTray.exe)
+# are signed first, the installer is then RE-BUILT so it embeds the signed
+# payload ("build.bat installer" relinks only the setup exe), and finally the
+# setup exe itself is signed. The release asset is the bare signed exe --
+# SmartScreen reputation and mark-of-the-web attach to the file users run.
+#
+# Required repository configuration (see README "Releases & code signing"):
+#   secret SIGNPATH_API_TOKEN     -- SignPath CI user API token
+#   var    SIGNPATH_ORG_ID       -- SignPath organization id
+# SignPath project "pscam4win" with signing policy "release-signing" and two
+# artifact configurations: "payload-binaries" (zip with the two PE files) and
+# "setup-exe" (zip with the single PE file).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Full build (unsigned)
+        shell: cmd
+        run: build.bat
+
+      - name: Upload unsigned payload binaries
+        id: upload-payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: payload-binaries
+          path: |
+            build/PSCam4Win.dll
+            build/PSCam4WinTray.exe
+          if-no-files-found: error
+
+      - name: Sign payload binaries (SignPath request 1)
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
+          project-slug: pscam4win
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: payload-binaries
+          github-artifact-id: ${{ steps.upload-payload.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed-payload
+
+      - name: Re-embed signed payload into the installer
+        shell: cmd
+        run: |
+          copy /y signed-payload\PSCam4Win.dll build\
+          copy /y signed-payload\PSCam4WinTray.exe build\
+          build.bat installer
+
+      - name: Upload unsigned setup exe
+        id: upload-setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-exe
+          path: build/PSCam4Win-Setup.exe
+          if-no-files-found: error
+
+      - name: Sign the installer (SignPath request 2)
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
+          project-slug: pscam4win
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: setup-exe
+          github-artifact-id: ${{ steps.upload-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed-setup
+
+      - name: Verify signatures
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature signed-setup/PSCam4Win-Setup.exe
+          $sig | Format-List Status, StatusMessage, SignerCertificate
+          if ($sig.Status -ne 'Valid') { throw "setup exe signature is $($sig.Status)" }
+
+      - name: Attach the signed installer to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: signed-setup/PSCam4Win-Setup.exe
+          generate_release_notes: true

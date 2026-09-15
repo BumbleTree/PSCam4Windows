@@ -161,15 +161,24 @@ private:
     framebus::Reader           _bus;
     ULONGLONG                  _nextBusRetryTick = 0;
     std::atomic<LONG64>        _lastFrameId{ 0 };
+    // Set once we have had to black-fill because the negotiated size cannot be
+    // produced from the bus. Advertising is supposed to make that unreachable,
+    // so it means the advertised types went stale — worth one loud trace rather
+    // than a silent black picture at full frame rate.
+    bool                       _warnedSizeMismatch = false;
     // Last good frame (starts black). shared_ptr: Start() may swap in a new
     // buffer (format renegotiation) while DeliverSample still copies from its
     // snapshot of the old one; shared ownership keeps that buffer alive.
     std::shared_ptr<uint8_t[]> _staging;
-    std::unique_ptr<uint8_t[]> _busStaging; // bus-sized scratch, allocated once, guarded by _deliverLock
+    // Bus-sized scratch from the ColdBlock's largest mode; guarded by
+    // _deliverLock. The bus can outgrow it without this stream re-initializing,
+    // so DeliverSample must check _busStagingBytes before reading into it.
+    std::unique_ptr<uint8_t[]> _busStaging;
+    uint32_t                   _busStagingBytes = 0;
     // JFIF sidecar scratch for MJPEG passthrough; allocated only when the device
     // advertises MJPEG (null on PS3 Eye). _lastJpegLen holds the last delivered
     // length so a deadline redeliver re-sends the previous JPEG. Guarded by
-    // _deliverLock. (TDD §5.4 / §8.2)
+    // _deliverLock.
     std::unique_ptr<uint8_t[]> _jpegStaging;
     uint32_t                   _lastJpegLen = 0;
 

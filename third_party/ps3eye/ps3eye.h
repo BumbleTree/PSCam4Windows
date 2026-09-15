@@ -225,6 +225,28 @@ private:
 	bool open_usb();
 	void close_usb();
 
+	// PSCam4Win patch — the microphone wedge.
+	// The OV534 carries both the video path and the USB audio function, and a
+	// warm reboot re-enumerates the audio function without ever dropping VBUS.
+	// Our bring-up alone is harmless and a re-enumeration alone is harmless,
+	// but a re-enumeration that finds the chip still holding our bring-up state
+	// kills the 4-mic array until the camera is physically replugged. So we put
+	// back what we changed before letting go of the device.
+	//
+	// Copy-on-write, deliberately: the FIRST write to a register saves its old
+	// value, and only those registers are restored. A blind sweep of the whole
+	// 0x00-0xFF space is NOT safe here — this space contains undocumented
+	// registers that govern how the chip enumerates, and writing them left the
+	// camera unable to present a valid device descriptor at all (Code 43,
+	// recoverable only by unplugging it). Restore what we touched; never write a
+	// register we did not. This also keeps itself honest: a register write added
+	// anywhere later is covered without anyone remembering to list it.
+	void capture_reg_if_clean(uint16_t reg);
+	void restore_written_regs();
+
+	uint8_t reg_saved_[256];
+	bool    reg_dirty_[256];
+	bool    restoring_;
 };
 
 } // namespace

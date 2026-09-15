@@ -90,6 +90,8 @@ public:
     // Milliseconds since a client last consumed frames (MAXULONGLONG if never).
     ULONGLONG ActivityAgeMs() const
     {
+        if (!_view)
+            return MAXULONGLONG;   // never created / already closed == never active
         const LONG64 tick = ReadAcquire64(&_view->lastActivityTick);
         if (tick == 0)
             return MAXULONGLONG;

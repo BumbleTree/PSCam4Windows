@@ -1,9 +1,7 @@
 # Vendored libusb (prebuilt)
 
 This directory vendors a prebuilt **libusb 1.0.27** so the project is self-contained: a fresh
-`git clone` of PS3EyeVCam builds with `build.bat` without any external dependency. Previously the
-build linked libusb from a neighbouring third-party repo (`jkevin/PS3EyeDirectShow`, which pinned an
-old libusb 1.0.19-442 submodule) via a hardcoded relative path — that is no longer required.
+`git clone` of PS3EyeVCam builds with `build.bat` without a separate libusb checkout.
 
 ## Contents
 
@@ -17,8 +15,9 @@ old libusb 1.0.19-442 submodule) via a hardcoded relative path — that is no lo
 
 - **libusb 1.0.27** (tag `v1.0.27`, commit `d52e355`).
 - Chosen because isochronous transfers on Windows require the full-speed frame-calculation fix
-  (libusb commit `8102b75`, first released in **1.0.25**). The PS2 EyeToy path (USB 1.1 full-speed
-  isochronous via the libusbK sub-API) depends on this. See `docs/TDD.md` §1.3 / Phase 0a.
+  (libusb commit `8102b75`, first released in **1.0.25**). The PS2 EyeToy path — USB 1.1 full-speed
+  isochronous — depends on it.
+- The EyeToy runs on the **inbox WinUSB backend**, without a libusbK driver install.
 
 ## How it was built (to reproduce / upgrade)
 

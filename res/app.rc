@@ -1,78 +1,25 @@
 #include <windows.h>
 #include "resource.h"
+#include "version.h"
 
 // First icon in the file is what Explorer shows for the exe.
 IDI_APP ICON "PSCam4Win.ico"
 
-IDD_SETTINGS DIALOGEX 0, 0, 460, 326
-STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+// The settings window is laid out in code (host/ui/SettingsWindow.cpp). This
+// shell exists so the dialog manager still handles Tab, Esc and mnemonics
+// through the main message loop's IsDialogMessageW; the size here is a
+// placeholder that the first layout replaces.
+IDD_SETTINGS DIALOGEX 0, 0, 400, 300
+STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "PSCam4Win"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "Camera:", -1, 12, 13, 52, 10
-    COMBOBOX        IDC_CAMCOMBO, 72, 11, 148, 140,
-                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-
-    LTEXT           "Video mode:", -1, 12, 29, 52, 10
-    COMBOBOX        IDC_MODECOMBO, 72, 27, 148, 140,
-                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-
-    AUTOCHECKBOX    "Flip &horizontally", IDC_FLIPH, 12, 45, 96, 10
-    AUTOCHECKBOX    "Flip &vertically", IDC_FLIPV, 122, 45, 96, 10
-    AUTOCHECKBOX    "Auto &white balance", IDC_AWB, 12, 59, 96, 10
-    AUTOCHECKBOX    "&Auto gain / exposure", IDC_AUTOGAIN, 122, 59, 96, 10
-    AUTOCHECKBOX    "Test Pattern", IDC_TESTPATTERN, 12, 73, 96, 10
-
-    LTEXT           "Gain:", -1, 12, 92, 52, 10
-    CONTROL         "", IDC_GAIN_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 89, 128, 16
-    CTEXT           "0", IDC_GAIN_LABEL, 198, 92, 24, 10
-
-    LTEXT           "Exposure:", -1, 12, 112, 52, 10
-    CONTROL         "", IDC_EXPOSURE_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 109, 128, 16
-    CTEXT           "0", IDC_EXPOSURE_LABEL, 198, 112, 24, 10
-
-    LTEXT           "Red gain:", -1, 12, 132, 52, 10
-    CONTROL         "", IDC_RED_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 129, 128, 16
-    CTEXT           "0", IDC_RED_LABEL, 198, 132, 24, 10
-
-    LTEXT           "Blue gain:", -1, 12, 152, 52, 10
-    CONTROL         "", IDC_BLUE_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 149, 128, 16
-    CTEXT           "0", IDC_BLUE_LABEL, 198, 152, 24, 10
-
-    LTEXT           "Green gain:", -1, 12, 172, 52, 10
-    CONTROL         "", IDC_GREEN_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 169, 128, 16
-    CTEXT           "0", IDC_GREEN_LABEL, 198, 172, 24, 10
-
-    LTEXT           "Brightness:", -1, 12, 192, 52, 10
-    CONTROL         "", IDC_BRIGHTNESS_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 189, 128, 16
-    CTEXT           "0", IDC_BRIGHTNESS_LABEL, 198, 192, 24, 10
-
-    LTEXT           "Saturation:", -1, 12, 212, 52, 10
-    CONTROL         "", IDC_SATURATION_SLIDER, "msctls_trackbar32",
-                    TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 66, 209, 128, 16
-    CTEXT           "0", IDC_SATURATION_LABEL, 198, 212, 24, 10
-
-    AUTOCHECKBOX    "&Start with Windows", IDC_AUTOSTART, 12, 231, 120, 10
-
-    LTEXT           "", IDC_STATUS_TEXT, 12, 252, 436, 30
-
-    CONTROL         "", IDC_PREVIEW, "Static", SS_SUNKEN | WS_CHILD | WS_VISIBLE,
-                    240, 11, 208, 160
-
-    PUSHBUTTON      "Reset &defaults", IDC_RESET, 12, 304, 72, 14
-    DEFPUSHBUTTON   "Close", IDOK, 398, 304, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    3,0,0,0
- PRODUCTVERSION 3,0,0,0
+ FILEVERSION    PSCAM_VERSION_COMMA
+ PRODUCTVERSION PSCAM_VERSION_COMMA
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         VOS_NT_WINDOWS32
@@ -85,11 +32,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "PSCam4Win"
             VALUE "FileDescription",  "PSCam4Win Virtual Camera"
-            VALUE "FileVersion",      "3.0.0.0"
+            VALUE "FileVersion",      PSCAM_VERSION_STRING
             VALUE "InternalName",     "PSCam4WinTray"
             VALUE "OriginalFilename", "PSCam4WinTray.exe"
             VALUE "ProductName",      "PSCam4Win Virtual Camera"
-            VALUE "ProductVersion",   "3.0.0.0"
+            VALUE "ProductVersion",   PSCAM_VERSION_STRING
         END
     END
     BLOCK "VarFileInfo"

@@ -12,6 +12,7 @@ public:
     static constexpr UINT WM_TRAY             = WM_APP + 1;  // Shell_NotifyIcon callback
     static constexpr UINT WM_CONTROLLER_STATE = WM_APP + 2;  // posted by CaptureController
     static constexpr UINT WM_SHOW_SETTINGS    = WM_APP + 3;  // posted by a second instance
+    static constexpr UINT WM_MIC_HEALTH       = WM_APP + 4;  // posted by micwatch's probe thread
 
     static constexpr wchar_t kWindowClass[] = L"PSCam4WinTrayWnd";
 
@@ -23,6 +24,12 @@ public:
     // "mode change deferred" balloon when applicable. Used by both the menu
     // and the settings dialog.
     void ApplySettings(int cameraIndex, const Settings& s, bool persistNow);
+
+    // Nudge every controller to re-evaluate slot occupancy (same path as a USB
+    // device-change). Used when a setting changes the slot MAP rather than one
+    // camera — e.g. toggling PS4 split, which adds/removes the second slot's
+    // virtual camera. Cheap: each asleep controller just rescans the registry.
+    void RescanAllControllers();
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
@@ -42,6 +49,7 @@ private:
     CaptureController* _controller = nullptr;
     UINT               _taskbarCreatedMsg = 0;
     bool               _iconAdded = false;
+    bool               _fpsTimerOn = false;   // armed only while streaming
     // One subscription per camera interface GUID (PS3 Eye + EyeToy); arrival or
     // removal of any wakes the capture threads to re-evaluate slot occupancy.
     HDEVNOTIFY         _devNotify[kCameraInterfaceGuidCount] = {};

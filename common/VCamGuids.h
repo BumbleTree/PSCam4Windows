@@ -5,11 +5,13 @@
 // CLSID_PS3EyeVCams[i] is the COM class registered by PSCam4Win.dll (the
 // IMFActivate implementation) for camera slot i. The host passes the string
 // form to MFCreateVirtualCamera as `sourceId`, and the Frame Server CoCreates
-// it inside its own service process. The GUIDs are intentionally retained
-// across the PS3EyeVCam->PSCam4Win rebrand to avoid COM re-registration churn.
-// The per-slot friendly NAME is chosen at registration time from the occupying
-// device's DeviceProfile (CaptureController), so a slot is no longer tied to
-// one product name.
+// it inside its own service process.
+//
+// These GUIDs are FROZEN. They are the COM identity every installed copy has
+// registered, so changing one strands that registration; the PS3EyeVCam name
+// they still carry is history, not meaning. The per-slot friendly NAME is
+// chosen at registration time from the occupying device's DeviceProfile, so a
+// slot's label follows its camera without the identity moving.
 //
 #include <guiddef.h>
 
