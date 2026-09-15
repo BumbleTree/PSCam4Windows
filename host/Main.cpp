@@ -20,6 +20,7 @@
 #include "TrayUI.h"
 #include "SettingsDialog.h"
 #include "Autostart.h"
+#include "ui/Theme.h"
 #include "../common/Settings.h"
 #include "../common/VCamGuids.h"
 
@@ -38,26 +39,35 @@ bool HasArg(int argc, wchar_t** argv, const wchar_t* name)
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
+    // The command line is consulted only here, so every flag is resolved up
+    // front and the allocation handed straight back — rather than tracking it
+    // across six exit paths. argc stays 0 if CommandLineToArgvW fails, so
+    // HasArg simply reports nothing set.
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    const bool wantSeedDefaults     = HasArg(argc, argv, L"--seed-defaults");
+    const bool wantEnableAutostart  = HasArg(argc, argv, L"--enable-autostart");
+    const bool wantDisableAutostart = HasArg(argc, argv, L"--disable-autostart");
+    const bool wantConsole          = HasArg(argc, argv, L"--console");
+    if (argv)
+        LocalFree(argv);
 
     // ---- one-shot installer verbs -------------------------------------------
-    if (HasArg(argc, argv, L"--seed-defaults"))
+    if (wantSeedDefaults)
     {
         for (int i = 0; i < kVCamCount; ++i)
             settings::SeedDefaults(i);
         return 0;
     }
-    if (HasArg(argc, argv, L"--enable-autostart") || HasArg(argc, argv, L"--disable-autostart"))
+    if (wantEnableAutostart || wantDisableAutostart)
     {
-        const bool enable = HasArg(argc, argv, L"--enable-autostart");
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        const bool ok = enable ? autostart::Enable() : autostart::Disable();
+        const bool ok = wantEnableAutostart ? autostart::Enable() : autostart::Disable();
         CoUninitialize();
         return ok ? 0 : 1;
     }
 
-    if (HasArg(argc, argv, L"--console"))
+    if (wantConsole)
     {
         AllocConsole();
         FILE* unused;
@@ -94,6 +104,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);  // UI thread STA
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
+    theme::Init();   // the tray menu draws from it, so it precedes the tray
 
     for (int i = 0; i < kVCamCount; ++i)
         settings::SeedDefaults(i);  // first run on a clean machine self-initializes
@@ -139,6 +150,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     {
         controllers[i].Stop();   // joins; tears down vcam -> camera -> shared memory
     }
+    theme::Shutdown();
     CoUninitialize();
     if (mutex)
         CloseHandle(mutex);

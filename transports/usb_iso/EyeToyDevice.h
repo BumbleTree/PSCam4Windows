@@ -11,7 +11,7 @@
 //      (decode JFIF -> YUY2) and/or hands the JFIF through for MJPEG clients
 //
 // The mailbox keeps the iso event thread free of any heavy work and keeps the
-// CaptureController the single FrameBus writer (docs/TDD.md §6.3).
+// CaptureController the single FrameBus writer.
 //
 #include <atomic>
 #include <condition_variable>

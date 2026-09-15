@@ -1,7 +1,10 @@
 #include "CameraPreview.h"
 
+#include "ui/Theme.h"
+
 #include <commctrl.h>
 #include <cstring>
+#include <new>       // std::nothrow (worker staging buffer)
 
 #include "CaptureController.h"
 #include "FrameBusPreviewSource.h"
@@ -137,6 +140,11 @@ void CameraPreview::StopWorker()
 
 void CameraPreview::SetCamera(int cameraIndex)
 {
+    // Re-targeting the same camera is a no-op, and must stay one: callers re-run
+    // it after any settings reload, and doing the work anyway would drop the
+    // "in use" badge and re-poke the controller awake on every slider release.
+    if (_cameraIndex.load(std::memory_order_relaxed) == cameraIndex)
+        return;
     const int oldIdx = _cameraIndex.exchange(cameraIndex, std::memory_order_relaxed);
     if (_controllers && oldIdx >= 0 && oldIdx != cameraIndex)
         (_controllers + oldIdx)->SetPreviewHold(false);
@@ -190,7 +198,7 @@ bool CameraPreview::RecreateDib(int width, int height)
 }
 
 LRESULT CALLBACK CameraPreview::SubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
-                                             UINT_PTR idSubclass, DWORD_PTR refData)
+                                             UINT_PTR /*idSubclass*/, DWORD_PTR refData)
 {
     auto* self = reinterpret_cast<CameraPreview*>(refData);
     switch (msg)
@@ -215,6 +223,12 @@ LRESULT CALLBACK CameraPreview::SubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPA
         return 1;  // we paint everything
     }
     return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+void CameraPreview::SetCell(const RECT& cellPx)
+{
+    _cell = cellPx;
+    ResizeToAspect();
 }
 
 void CameraPreview::ResizeToAspect()
@@ -337,9 +351,9 @@ void CameraPreview::Paint(HDC hdc, int w, int h)
     if (!haveFrame)
     {
         RECT rc{ 0, 0, w, h };
-        FillRect(dc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        theme::Fill(dc, rc, theme::C().bgInset);
         const wchar_t* text = L"Waiting for camera...";
-        SetTextColor(dc, RGB(170, 170, 170));
+        SetTextColor(dc, theme::C().fgMuted);
         SetBkMode(dc, TRANSPARENT);
         DrawTextW(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
@@ -353,10 +367,8 @@ void CameraPreview::Paint(HDC hdc, int w, int h)
         GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &sz);
         const int bw = sz.cx + 8, bh = sz.cy + 4;
         RECT badge{ 6, 4, 6 + bw, 4 + bh };
-        const HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(dc, &badge, bg);
-        DeleteObject(bg);
-        SetTextColor(dc, RGB(255, 220, 0));
+        theme::Fill(dc, badge, theme::C().bgInset);
+        SetTextColor(dc, theme::C().warn);
         SetBkMode(dc, TRANSPARENT);
         DrawTextW(dc, text, -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
@@ -374,8 +386,14 @@ DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
 {
     auto* self = static_cast<CameraPreview*>(selfp);
 
-    // Staging buffer for raw YUY2 from the source.
-    std::unique_ptr<uint8_t[]> staging(new uint8_t[framebus::kMaxFrameBytes]);
+    // Staging buffer for raw YUY2 from the source. Sized to the absolute max so
+    // it fits any slot's frame (PS4 eyes/combined are larger than 640x480).
+    //
+    // nothrow: this is a raw thread proc, so an escaping bad_alloc would reach
+    // std::terminate. No preview is a fine outcome; a dead tray is not.
+    std::unique_ptr<uint8_t[]> staging(new (std::nothrow) uint8_t[framebus::kAbsMaxFrameBytes]);
+    if (!staging)
+        return 0;
     LONG64 lastFrameId = 0;
     uint32_t lastFmtW = 0, lastFmtH = 0;
     int openForCamera = -1;
@@ -453,7 +471,7 @@ DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
         }
 
         const uint32_t dstBytes = framebus::Yuy2Bytes(w, h);
-        if (dstBytes == 0 || dstBytes > framebus::kMaxFrameBytes)
+        if (dstBytes == 0 || dstBytes > framebus::kAbsMaxFrameBytes)
             continue;
 
         const LONG64 id = self->_source->TryReadNewer(staging.get(), dstBytes, lastFrameId);

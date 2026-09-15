@@ -1378,6 +1378,9 @@ PS3EYECam::PS3EYECam(libusb_device *device)
     testPattern = false;
 	usb_buf = NULL;
 	handle_ = NULL;
+	restoring_ = false;
+	memset(reg_saved_, 0, sizeof(reg_saved_));
+	memset(reg_dirty_, 0, sizeof(reg_dirty_));
 
 	is_streaming = false;
 
@@ -1399,9 +1402,43 @@ PS3EYECam::~PS3EYECam()
 	}
 }
 
+// 0x1C/0x1D are the bridge's address/data FIFO port pair: reading 0x1D advances
+// it, so they can be neither saved nor put back. The bring-up writes them; that
+// is accepted, because a FIFO has no "previous value" to restore.
+static inline bool ps3_is_fifo_port(int reg) { return reg == 0x1C || reg == 0x1D; }
+
+void PS3EYECam::capture_reg_if_clean(uint16_t reg)
+{
+	if (restoring_ || reg > 0xFF || ps3_is_fifo_port(reg))
+		return;
+	if (reg_dirty_[reg] || handle_ == NULL || usb_buf == NULL)
+		return;
+	// Read before the caller's write lands, so this is genuinely the value the
+	// chip had before we touched it.
+	reg_dirty_[reg] = true;
+	reg_saved_[reg] = ov534_reg_read(reg);
+}
+
+void PS3EYECam::restore_written_regs()
+{
+	if (handle_ == NULL || usb_buf == NULL)
+		return;
+	restoring_ = true;   // stop the writes below re-capturing what they overwrite
+	for (int r = 0; r <= 0xFF; ++r)
+		if (reg_dirty_[r])
+			ov534_reg_write((uint16_t)r, reg_saved_[r]);
+	restoring_ = false;
+	memset(reg_dirty_, 0, sizeof(reg_dirty_));
+}
+
 void PS3EYECam::release()
 {
-	if(handle_ != NULL) 
+	// Put the chip back before we let go of it: the next enumeration must not
+	// find our bring-up state, or the microphone dies until a physical replug.
+	// Here rather than in stop() so every path that drops the device is covered
+	// -- a failed init(), the destructor, and stop() itself.
+	restore_written_regs();
+	if(handle_ != NULL)
 		close_usb();
 	if(usb_buf) {
 		free(usb_buf);
@@ -1715,6 +1752,7 @@ void PS3EYECam::ov534_reg_write(uint16_t reg, uint8_t val)
 	int ret;
 
 	//debug("reg=0x%04x, val=0%02x", reg, val);
+	capture_reg_if_clean(reg);   // save the old value the first time we touch it
 	usb_buf[0] = val;
 
   	ret = libusb_control_transfer(handle_,

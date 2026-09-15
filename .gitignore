@@ -1,11 +1,6 @@
 # Compiled binaries and build artifacts
 build/
 
-# Phase 0 scratch / external reference (not committed)
-_libusb_src/
-_ref/
-tools/fixtures/*.bin
-
 # MSVC compiler intermediate files
 *.obj
 *.pdb
@@ -24,8 +19,5 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
-# Project documentation
-docs/
-
-# Developer tools
-tools/
+# Local release zip (official releases ship the bare signed setup exe)
+PSCam4Win-Release.zip

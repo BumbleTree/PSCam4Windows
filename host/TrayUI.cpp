@@ -8,6 +8,9 @@
 
 #include "SettingsDialog.h"
 #include "Autostart.h"
+#include "DeviceRegistry.h"
+#include "MicWatch.h"
+#include "ui/TrayMenu.h"
 #include "../common/VCamGuids.h"
 #include "../res/resource.h"
 
@@ -59,11 +62,17 @@ bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
     }
 
     AddTrayIcon();
+
+    // A camera wedged before we started is the case prevention cannot reach —
+    // the state was left on the chip by an earlier session, and only a replug
+    // clears it. Ask once, after the shell and usbaudio have settled.
+    SetTimer(_hwnd, 2, 8000, nullptr);
     return true;
 }
 
 void TrayUI::Destroy()
 {
+    micwatch::Shutdown();   // the probe posts to _hwnd; join it before it goes
     RemoveTrayIcon();
     for (int i = 0; i < kCameraInterfaceGuidCount; ++i)
     {
@@ -125,6 +134,7 @@ void TrayUI::UpdateTooltip()
     int streamingCount = 0;
     int asleepCount = 0;
     int failedCount = 0;
+    int replugCount = 0;
     float maxFps = 0.0f;
 
     for (int i = 0; i < kVCamCount; ++i)
@@ -142,6 +152,9 @@ void TrayUI::UpdateTooltip()
         case CaptureController::State::VCamFailed:
             failedCount++;
             break;
+        case CaptureController::State::Ps4NeedsReplug:
+            replugCount++;
+            break;
         default:
             break;
         }
@@ -151,6 +164,10 @@ void TrayUI::UpdateTooltip()
     {
         swprintf_s(nid.szTip, L"PSCam4Win — %d streaming (max %.1f fps), %d idle",
                    streamingCount, maxFps, asleepCount);
+    }
+    else if (replugCount > 0)
+    {
+        wcscpy_s(nid.szTip, L"PSCam4Win — PS4 camera needs a replug");
     }
     else if (failedCount > 0)
     {
@@ -176,8 +193,11 @@ void TrayUI::ShowBalloon(const wchar_t* title, const wchar_t* text)
     nid.uID = kTrayIconId;
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
-    wcscpy_s(nid.szInfoTitle, title);
-    wcscpy_s(nid.szInfo, text);
+    // _TRUNCATE, not wcscpy_s: these fields are 64 and 256 wide, and wcscpy_s
+    // ABORTS the process on overflow rather than truncating. A balloon whose
+    // wording grew past the limit must lose its tail, not take the tray down.
+    wcsncpy_s(nid.szInfoTitle, title, _TRUNCATE);
+    wcsncpy_s(nid.szInfo, text, _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
@@ -202,52 +222,64 @@ void TrayUI::ApplySettings(int cameraIndex, const Settings& s, bool persistNow)
     }
 }
 
+void TrayUI::RescanAllControllers()
+{
+    if (!_controllers)
+        return;
+    // Drop the cached slot map FIRST, exactly as the PnP path does.
+    //
+    // Callers reach here after changing something the map is COMPUTED FROM --
+    // a PS4 Split or View setting -- and the registry cannot see a registry
+    // write, so without this every query is served from a map up to its 2 s TTL
+    // old. The settings dialog then repaints from that stale map: the Split
+    // checkbox appears not to take for a second or two, and mid-unsplit both
+    // slots still look like un-split PS4 cameras, so the duplicate-name rule
+    // suffixes them ("PS4 Camera #5") until the TTL expires.
+    deviceregistry::Invalidate();
+    for (int i = 0; i < kVCamCount; ++i)
+        _controllers[i].NotifyDeviceChange();
+}
+
 void TrayUI::ShowContextMenu(POINT anchor)
 {
-    HMENU menu = CreatePopupMenu();
-    const Settings s = settings::Load(0);
-    const int activeMode = settings::FindModeIndex(s.width, s.height, s.fps);
-
-    HMENU modeMenu = CreatePopupMenu();
-    for (int i = 0; i < kVideoModeCount; ++i)
-    {
-        wchar_t item[48];
-        swprintf_s(item, L"%u x %u @ %u fps", kVideoModes[i].width,
-                   kVideoModes[i].height, kVideoModes[i].fps);
-        AppendMenuW(modeMenu, MF_STRING | (i == activeMode ? MF_CHECKED : 0),
-                    IDM_MODE_BASE + i, item);
-    }
-
-    AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"&Settings…");
-    SetMenuDefaultItem(menu, IDM_SETTINGS, FALSE);
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    // Quick toggles act on camera 0 only; per-camera control is in Settings.
-    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"PSCam4Win — camera 0");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(modeMenu), L"Video &mode");
-    AppendMenuW(menu, MF_STRING | (s.flipH ? MF_CHECKED : 0), IDM_FLIPH, L"Flip &horizontally");
-    AppendMenuW(menu, MF_STRING | (s.flipV ? MF_CHECKED : 0), IDM_FLIPV, L"Flip &vertically");
-    AppendMenuW(menu, MF_STRING | (s.autoGain ? MF_CHECKED : 0), IDM_AUTOGAIN, L"&Auto gain && exposure");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (autostart::IsEnabled() ? MF_CHECKED : 0),
-                IDM_AUTOSTART, L"Start with &Windows");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"E&xit");
-
-    // Classic tray-menu dance: foreground first or the menu won't dismiss.
-    SetForegroundWindow(_hwnd);
-    TrackPopupMenuEx(menu, TPM_RIGHTBUTTON, anchor.x, anchor.y, _hwnd, nullptr);
-    PostMessageW(_hwnd, WM_NULL, 0, 0);
-    DestroyMenu(menu);  // also destroys the submenu
+    const int chosen = traymenu::Track(_hwnd, anchor, _controllers);
+    traymenu::Cleanup();
+    if (chosen)
+        OnCommand(chosen);
 }
 
 void TrayUI::OnCommand(int id)
 {
-    if (id >= IDM_MODE_BASE && id < IDM_MODE_BASE + kVideoModeCount)
+    traymenu::Command cmd{};
+    if (traymenu::Decode(id, cmd))
     {
-        Settings s = settings::Load(0);
-        const VideoMode& m = kVideoModes[id - IDM_MODE_BASE];
-        s.width = m.width; s.height = m.height; s.fps = m.fps;
-        ApplySettings(0, s, true);
+        // Re-resolved rather than cached: the camera can be unplugged between
+        // the menu opening and the click landing.
+        const DeviceProfile* prof = deviceregistry::ProfileForSlot(cmd.slot);
+        if (!prof)
+            return;
+        Settings s = settings::Load(cmd.slot);
+
+        if (cmd.item >= traymenu::ItemModeBase)
+        {
+            const int i = cmd.item - traymenu::ItemModeBase;
+            if (i >= static_cast<int>(prof->modeCount))
+                return;
+            s.width  = prof->modes[i].width;
+            s.height = prof->modes[i].height;
+            s.fps    = prof->modes[i].fps;
+        }
+        else
+        {
+            switch (cmd.item)
+            {
+            case traymenu::ItemFlipH:    s.flipH    = !s.flipH;    break;
+            case traymenu::ItemFlipV:    s.flipV    = !s.flipV;    break;
+            case traymenu::ItemAutoGain: s.autoGain = !s.autoGain; break;
+            default: return;
+            }
+        }
+        ApplySettings(cmd.slot, s, true);
         settingsdialog::RefreshStatus();
         return;
     }
@@ -257,27 +289,6 @@ void TrayUI::OnCommand(int id)
     case IDM_SETTINGS:
         settingsdialog::Show(_instance, _controller);
         break;
-    case IDM_FLIPH:
-    {
-        Settings s = settings::Load(0);
-        s.flipH = !s.flipH;
-        ApplySettings(0, s, true);
-        break;
-    }
-    case IDM_FLIPV:
-    {
-        Settings s = settings::Load(0);
-        s.flipV = !s.flipV;
-        ApplySettings(0, s, true);
-        break;
-    }
-    case IDM_AUTOGAIN:
-    {
-        Settings s = settings::Load(0);
-        s.autoGain = !s.autoGain;
-        ApplySettings(0, s, true);
-        break;
-    }
     case IDM_AUTOSTART:
         if (autostart::IsEnabled())
             autostart::Disable();
@@ -318,9 +329,16 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     switch (msg)
     {
-    case WM_COMMAND:   // context-menu selections from TrackPopupMenuEx
-        OnCommand(LOWORD(wParam));
-        return 0;
+    // The menu is owner-drawn (Win32 popups follow no app theme) and tracked
+    // with TPM_RETURNCMD, so selections come back from Track rather than as
+    // WM_COMMAND; only the drawing messages arrive here.
+    case WM_MEASUREITEM:
+        traymenu::MeasureItem(reinterpret_cast<MEASUREITEMSTRUCT*>(lParam));
+        return TRUE;
+
+    case WM_DRAWITEM:
+        traymenu::DrawItem(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
+        return TRUE;
 
     case WM_TRAY:
         switch (LOWORD(lParam))
@@ -345,14 +363,39 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             const auto* hdr = reinterpret_cast<const DEV_BROADCAST_HDR*>(lParam);
             if (hdr->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE && _controllers)
             {
+                // Drop the cached slot map BEFORE waking the controllers, so the
+                // first one to query re-enumerates and the rest reuse that result.
+                deviceregistry::Invalidate();
                 for (int i = 0; i < kVCamCount; ++i)
                     _controllers[i].NotifyDeviceChange();
+                // A replug is exactly what cures the microphone wedge, so a
+                // camera that just arrived deserves a fresh answer. Deferred:
+                // usbaudio has not built the endpoint yet at DBT_DEVICEARRIVAL,
+                // and probing now would just read Unknown.
+                micwatch::Reset();
+                SetTimer(hwnd, 2, 4000, nullptr);
             }
         }
         return TRUE;
 
     case WM_CONTROLLER_STATE:
         UpdateTooltip();
+        // Arm the fps refresh only while something is streaming.
+        {
+            bool anyStreaming = false;
+            for (int i = 0; i < kVCamCount && !anyStreaming; ++i)
+                anyStreaming = (_controllers[i].GetState() == CaptureController::State::Streaming);
+            if (anyStreaming && !_fpsTimerOn)
+            {
+                SetTimer(hwnd, 1, 3000, nullptr);
+                _fpsTimerOn = true;
+            }
+            else if (!anyStreaming && _fpsTimerOn)
+            {
+                KillTimer(hwnd, 1);
+                _fpsTimerOn = false;
+            }
+        }
         settingsdialog::RefreshStatus();
         // A state change is also how a plug/unplug surfaces (a slot enters or
         // leaves CameraMissing): keep the Settings dropdown in sync. Internally
@@ -363,6 +406,14 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             ShowBalloon(L"PSCam4Win",
                         L"A fatal error occurred — the virtual camera is not available.");
         }
+        else if (static_cast<CaptureController::State>(wParam) == CaptureController::State::Ps4NeedsReplug)
+        {
+            // SetState posts only on a state change, so this fires once per wedged
+            // episode rather than on every retry.
+            ShowBalloon(L"PS4 Camera — please replug",
+                        L"The PS4 camera needs to be unplugged and plugged back in to "
+                        L"reload its firmware. This happens after the app restarts.");
+        }
         return 0;
 
     case WM_SHOW_SETTINGS:  // second app instance launched
@@ -372,10 +423,29 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_TIMER:
         if (wParam == 1)
             UpdateTooltip();  // periodic fps refresh while streaming
+        else if (wParam == 2)
+        {
+            KillTimer(hwnd, 2);   // one-shot: fires once per device change
+            micwatch::CheckPs3Async(hwnd, WM_MIC_HEALTH);
+        }
+        return 0;
+
+    case WM_MIC_HEALTH:
+        // Only Wedged is worth interrupting anyone over. Unknown means the probe
+        // could not tell (no camera, endpoint busy) and must never be dressed up
+        // as a fault; Alive is the expected case and says nothing.
+        if (static_cast<micwatch::Health>(wParam) == micwatch::Health::Wedged)
+        {
+            ShowBalloon(L"PS3 Eye microphone — please replug",
+                        L"The camera's microphone has stopped delivering audio. "
+                        L"Unplug the PS3 Eye and plug it back in — nothing else "
+                        L"recovers it, and the video is unaffected.");
+        }
+        settingsdialog::RefreshStatus();
         return 0;
 
     case WM_CREATE:
-        SetTimer(hwnd, 1, 3000, nullptr);
+        // No timer here: it is armed on the first Streaming transition below.
         return 0;
 
     case WM_DESTROY:

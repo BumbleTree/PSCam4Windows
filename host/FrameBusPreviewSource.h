@@ -12,7 +12,7 @@
 //
 // Lives entirely on the preview worker thread; no shared mutable state.
 //
-// INVARIANT (docs/TDD.md §5.3): this source MUST poll the seqlock (Sleep-based
+// INVARIANT: this source MUST poll the seqlock (Sleep-based
 // WaitFrame), never wait on the ".FrameReady" event. That event is auto-reset,
 // so SetEvent releases exactly one waiter; the single permitted waiter is the
 // DLL's DeliverSample. A preview that waited on it would steal wakeups and

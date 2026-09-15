@@ -3,7 +3,6 @@
 [Strings]
 DeviceName = "PS3Eye Camera"
 VendorName = "Nam Tai E&E Products Ltd. or OmniVision Technologies, Inc."
-SourceName = "PS3Eye Camera Install Disk"
 DeviceID   = "VID_1415&PID_2000&MI_00"
 DeviceGUID = "{4BCC4C51-4249-4AE8-98BF-356B2C530E77}"
 
@@ -11,9 +10,9 @@ DeviceGUID = "{4BCC4C51-4249-4AE8-98BF-356B2C530E77}"
 Signature   = "$Windows NT$"
 Class       = "USBDevice"
 ClassGuid   = {88bae032-5a81-49f0-bc3d-a4ff138216d6}
-Provider    = "libwdi"
+Provider    = "PSCam4Win"
 CatalogFile = usb_device.cat
-DriverVer   = 08/09/2018, 6.1.7600.16385
+DriverVer   = 08/31/2026, 4.0.0.0
 
 [ClassInstall32]
 Addreg = WinUSBDeviceClassReg
@@ -58,37 +57,6 @@ KmdfLibraryVersion = 1.11
 [USB_Install.HW]
 AddReg = AddDeviceInterfaceGUID
 
-[NoDeviceInterfaceGUID]
-; Avoids adding a DeviceInterfaceGUID for generic driver
-
 [AddDeviceInterfaceGUID]
 HKR,,DeviceInterfaceGUIDs,0x10000,%DeviceGUID%
 
-[USB_Install.CoInstallers]
-AddReg    = CoInstallers_AddReg
-CopyFiles = CoInstallers_CopyFiles
-
-[CoInstallers_AddReg]
-HKR,,CoInstallers32,0x00010000,"WdfCoInstaller01011.dll,WdfCoInstaller","WinUSBCoInstaller2.dll"
-
-[CoInstallers_CopyFiles]
-WinUSBCoInstaller2.dll
-WdfCoInstaller01011.dll
-
-[DestinationDirs]
-CoInstallers_CopyFiles = 11
-
-[SourceDisksNames]
-1 = %SourceName%
-
-[SourceDisksFiles.x86]
-WinUSBCoInstaller2.dll = 1,x86
-WdfCoInstaller01011.dll = 1,x86
-
-[SourceDisksFiles.amd64]
-WinUSBCoInstaller2.dll = 1,amd64
-WdfCoInstaller01011.dll = 1,amd64
-
-[SourceDisksFiles.arm]
-WinUSBCoInstaller2.dll = 1,arm
-WdfCoInstaller01011.dll = 1,arm

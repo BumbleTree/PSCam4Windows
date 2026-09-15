@@ -1,0 +1,29 @@
+# Line-ending policy.
+#
+# THE ONE THAT MATTERS: driver/*.inf must never be translated.
+#
+# A driver package's .cat catalog stores a hash OF THE INF FILE'S BYTES. With
+# core.autocrlf=true and no rule here, Git stores the INF with LF and checks it
+# out with CRLF — one extra byte per line — so the file on disk no longer hashes
+# to what the signed catalog says. pnputil then refuses the whole package with
+# "The hash for the file is not present in the specified catalog file. The file
+# is likely corrupt or the victim of tampering", and NO CAMERA DRIVER CAN BE
+# INSTALLED.
+#
+# It fails silently and only for NEW installs — an already-bound machine keeps
+# working, so it survives testing on the developer's own box. Every CI build,
+# which starts from a fresh clone, produces a setup exe that cannot install a
+# driver.
+#
+# `-text` means "never convert, in either direction". Do not remove it, and do
+# not hand-edit an INF without regenerating its catalog (driver/generate_driver.ps1).
+driver/*.inf -text
+
+# The rest of the driver package is binary: signed catalogs and DER certificates.
+driver/*.cat binary
+driver/*.cer binary
+
+# Vendored prebuilt libraries and binary assets.
+*.lib binary
+*.ico binary
+*.bin binary

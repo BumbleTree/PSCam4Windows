@@ -31,7 +31,7 @@ bool FrameBusPreviewSource::ReadFormat(uint32_t& width, uint32_t& height, uint32
 
 void FrameBusPreviewSource::WaitFrame(DWORD timeoutMs) const
 {
-    // INVARIANT (docs/TDD.md §5.3): poll the seqlock, never wait on the shared
+    // INVARIANT: poll the seqlock, never wait on the shared
     // ".FrameReady" event. It is auto-reset, so SetEvent wakes exactly ONE
     // waiter; the single permitted waiter is the virtual camera DLL's
     // DeliverSample. Waiting here would steal its wakeups and starve clients

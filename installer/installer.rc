@@ -1,0 +1,151 @@
+// Resources for PSCam4Win-Setup.exe.
+//
+// Data-file paths are repo-root-relative: build.bat invokes rc with
+// /i "<repo root>" so payload embedding works no matter the CWD. The
+// binaries referenced from build\ must exist before this compiles (the
+// installer phase runs after the main build).
+#include <windows.h>
+#include "installer_resource.h"
+#include "version.h"
+
+// First icon in the file is what Explorer shows for the exe.
+IDI_SETUP ICON "res\\PSCam4Win.ico"
+
+// ---- embedded payload (raw, uncompressed) ----------------------------------
+IDR_PAYLOAD_DLL   RCDATA "build\\PSCam4Win.dll"
+IDR_PAYLOAD_TRAY  RCDATA "build\\PSCam4WinTray.exe"
+IDR_LICENSE       RCDATA "LICENSE"
+IDR_INF_PS3       RCDATA "driver\\usb_device.inf"
+IDR_CAT_PS3       RCDATA "driver\\usb_device.cat"
+IDR_CER_PS3       RCDATA "driver\\usb_device.cer"
+IDR_INF_EYETOY    RCDATA "driver\\eyetoy_device.inf"
+IDR_CAT_EYETOY    RCDATA "driver\\eyetoy_device.cat"
+IDR_CER_EYETOY    RCDATA "driver\\eyetoy_device.cer"
+IDR_INF_PS4       RCDATA "driver\\ps4cam_device.inf"
+IDR_CAT_PS4       RCDATA "driver\\ps4cam_device.cat"
+IDR_CER_PS4       RCDATA "driver\\ps4cam_device.cer"
+
+// ---- wizard frame ------------------------------------------------------------
+IDD_SETUP_FRAME DIALOGEX 0, 0, 360, 244
+STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "PSCam4Win Setup"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_HEADER_TITLE, 12, 8, 336, 12
+    LTEXT           "", IDC_HEADER_SUB, 12, 21, 336, 10
+    CONTROL         "", -1, "Static", SS_ETCHEDHORZ, 0, 34, 360, 1
+    // pages occupy (0,36)-(360,206)
+    CONTROL         "", -1, "Static", SS_ETCHEDHORZ, 0, 212, 360, 1
+    PUSHBUTTON      "< &Back", IDC_BACK, 184, 222, 50, 14
+    DEFPUSHBUTTON   "&Next >", IDC_NEXT, 238, 222, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 298, 222, 50, 14
+END
+
+// ---- pages (children of the frame, toggled with ShowWindow) -------------------
+IDD_PAGE_WELCOME DIALOGEX 0, 36, 360, 170
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_WELCOME_TEXT, 12, 10, 336, 148
+END
+
+IDD_PAGE_LICENSE DIALOGEX 0, 36, 360, 170
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    EDITTEXT        IDC_LICENSE_EDIT, 12, 4, 336, 138,
+                    ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
+    AUTOCHECKBOX    "I accept the terms of the GNU General Public License v2",
+                    IDC_LICENSE_ACCEPT, 12, 148, 330, 10
+END
+
+IDD_PAGE_COMPONENTS DIALOGEX 0, 36, 360, 170
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Camera drivers to install:", -1, 12, 4, 336, 10
+    AUTOCHECKBOX    "PS3 Eye  (640x480 @ 60 fps, 4-mic array)",
+                    IDC_COMP_PS3, 20, 17, 320, 10
+    AUTOCHECKBOX    "PS2 EyeToy  (320x240 / 640x480)",
+                    IDC_COMP_EYETOY, 20, 30, 320, 10
+    AUTOCHECKBOX    "PS4 Camera  (stereo colour, 1280x800@60 to 320x192@240, 4-mic array)",
+                    IDC_COMP_PS4, 20, 43, 320, 10
+    LTEXT           "PS4 camera firmware is downloaded automatically during setup.",
+                    -1, 32, 56, 320, 9
+    LTEXT           "Options:", -1, 12, 72, 336, 10
+    AUTOCHECKBOX    "Start PSCam4Win automatically at Windows logon",
+                    IDC_OPT_AUTOSTART, 20, 85, 320, 10
+    AUTOCHECKBOX    "Launch PSCam4Win when setup finishes",
+                    IDC_OPT_LAUNCH, 20, 98, 320, 10
+    LTEXT           "", IDC_COMP_PATH, 12, 112, 336, 10
+    LTEXT           "", IDC_COMP_NOTE, 12, 126, 336, 42
+END
+
+IDD_PAGE_PROGRESS DIALOGEX 0, 36, 360, 170
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_PROGRESS_STEP, 12, 4, 336, 10
+    CONTROL         "", IDC_PROGRESS_BAR, "msctls_progress32",
+                    WS_CHILD | WS_VISIBLE, 12, 17, 336, 10
+    EDITTEXT        IDC_PROGRESS_LOG, 12, 33, 336, 132,
+                    ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
+END
+
+IDD_PAGE_FINISH DIALOGEX 0, 36, 360, 170
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_FINISH_TEXT, 12, 10, 336, 116
+    LTEXT           "", IDC_FINISH_REBOOT, 12, 132, 336, 20, NOT WS_VISIBLE
+END
+
+IDD_PAGE_MAINTENANCE DIALOGEX 0, 36, 360, 170
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_MAINT_TEXT, 12, 10, 336, 44
+    AUTORADIOBUTTON "&Reinstall / repair (keeps saved settings)",
+                    IDC_MAINT_REINSTALL, 20, 62, 320, 10, WS_GROUP
+    AUTORADIOBUTTON "&Uninstall PSCam4Win from this computer",
+                    IDC_MAINT_UNINSTALL, 20, 78, 320, 10
+END
+
+IDD_PAGE_UNCONFIRM DIALOGEX 0, 36, 360, 170
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_UN_TEXT, 12, 10, 336, 70
+    AUTOCHECKBOX    "Also remove saved camera settings and the PS4 firmware cache",
+                    IDC_UN_REMOVEDATA, 12, 88, 336, 10
+END
+
+// ---- version ---------------------------------------------------------------------
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    PSCAM_VERSION_COMMA
+ PRODUCTVERSION PSCAM_VERSION_COMMA
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "PSCam4Win"
+            VALUE "FileDescription",  "PSCam4Win Virtual Camera Setup"
+            VALUE "FileVersion",      PSCAM_VERSION_STRING
+            VALUE "InternalName",     "PSCam4Win-Setup"
+            VALUE "OriginalFilename", "PSCam4Win-Setup.exe"
+            VALUE "ProductName",      "PSCam4Win Virtual Camera"
+            VALUE "ProductVersion",   PSCAM_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

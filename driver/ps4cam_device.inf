@@ -1,0 +1,87 @@
+; ps4cam_device.inf
+; Binds the inbox, Microsoft-signed WinUSB.sys to the PlayStation 4 Camera so
+; the user-space libusb path can open it. No custom kernel driver.
+;
+; The PS4 camera enumerates in a bootloader state as VID_05A9&PID_0580
+; ("USB Boot") and does nothing until firmware is uploaded over USB. What it
+; re-enumerates as depends on the firmware build:
+;   - legacy ps4eye blob  -> VID_05A9&PID_058A, a FLAT vendor-style device;
+;     bound to WinUSB on the WHOLE device (bare hardware ID, no MI_xx).
+;   - final 6.00+ blob    -> VID_05A9&PID_058B, a COMPOSITE device whose IAD
+;     video function is the MI_00 child; WinUSB binds THAT child (the parent
+;     stays on the inbox usbccgp), mirroring the EyeToy MI_00 approach. The
+;     specific MI_00 hardware-ID match outranks the inbox UVC driver's
+;     class/compatible-ID match, so PSCam4Win owns the camera while installed.
+; All IDs are staged, so WinUSB re-binds automatically across the
+; 0580 -> 058A/058B firmware reboot for either build.
+;
+; Mirrors eyetoy_device.inf / usb_device.inf; generated/signed the same way via
+; generate_driver.ps1 (self-signed catalog trusted at install time).
+[Strings]
+DeviceName  = "PlayStation 4 Camera"
+VendorName  = "Sony / OmniVision Technologies, Inc."
+DeviceIDA   = "VID_05A9&PID_0580"
+DeviceIDB   = "VID_05A9&PID_058A"
+DeviceIDC   = "VID_05A9&PID_058B&MI_00"
+DeviceGUID  = "{B8F4A2C0-5D31-4E76-9A1B-6C0E3F8D2A47}"
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "USBDevice"
+ClassGuid   = {88bae032-5a81-49f0-bc3d-a4ff138216d6}
+Provider    = "PSCam4Win"
+CatalogFile = ps4cam_device.cat
+DriverVer   = 08/31/2026, 4.0.0.0
+
+[ClassInstall32]
+Addreg = WinUSBDeviceClassReg
+
+[WinUSBDeviceClassReg]
+HKR,,,0,"Universal Serial Bus devices"
+HKR,,Icon,,-20
+
+[Manufacturer]
+%VendorName% = libusbDevice_WinUSB,NTx86,NTamd64,NTarm
+
+[libusbDevice_WinUSB.NTx86]
+%DeviceName% = USB_Install, USB\%DeviceIDA%
+%DeviceName% = USB_Install, USB\%DeviceIDB%
+%DeviceName% = USB_Install, USB\%DeviceIDC%
+
+[libusbDevice_WinUSB.NTamd64]
+%DeviceName% = USB_Install, USB\%DeviceIDA%
+%DeviceName% = USB_Install, USB\%DeviceIDB%
+%DeviceName% = USB_Install, USB\%DeviceIDC%
+
+[libusbDevice_WinUSB.NTarm]
+%DeviceName% = USB_Install, USB\%DeviceIDA%
+%DeviceName% = USB_Install, USB\%DeviceIDB%
+%DeviceName% = USB_Install, USB\%DeviceIDC%
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include    = winusb.inf
+AddService = WinUSB,0x00000002,WinUSB_ServiceInstall
+
+[WinUSB_ServiceInstall]
+DisplayName   = "WinUSB - Kernel Driver 08/09/2018 6.1.7600.16385"
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WinUSB.sys
+
+[USB_Install.Wdf]
+KmdfService = WINUSB, WinUsb_Install
+
+[WinUSB_Install]
+KmdfLibraryVersion = 1.11
+
+[USB_Install.HW]
+AddReg = AddDeviceInterfaceGUID
+
+[AddDeviceInterfaceGUID]
+HKR,,DeviceInterfaceGUIDs,0x10000,%DeviceGUID%
+

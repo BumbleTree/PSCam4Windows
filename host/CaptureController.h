@@ -1,19 +1,23 @@
 #pragma once
 //
-// CaptureController — the camera thread. Owns everything hardware- and
-// MF-related: the PS3EYECam object, the FrameBus writer, the ControlBus host,
-// and the IMFVirtualCamera registration. Runs the sleep/wake state machine:
+// CaptureController — the camera thread, one per slot. Owns everything hardware-
+// and MF-related: the slot's ICameraDevice (whichever transport the
+// DeviceRegistry hands it), the FrameBus writer, the ControlBus host, and the
+// IMFVirtualCamera registration. It never switches on a product enum — device
+// differences live behind ICameraDevice and its static DeviceProfile. Runs the
+// sleep/wake state machine:
 //
 //   ASLEEP    camera fully released (USB closed, LED off, 0% CPU); waiting on
 //             the ControlBus wake event the DLL pulses when a client streams
 //   WAKING    re-enumerate + init + start (~0.7s, clients see black frames)
-//   STREAMING getFrame (fused Bayer->YUY2 debayer) -> FrameBus publish; back
-//             to ASLEEP when the DLL keepalive goes stale (no client for
-//             idleTimeoutMs)
+//   STREAMING AcquireFrame (the device does its own debayer / JPEG decode /
+//             band copy) -> FrameBus publish; back to ASLEEP when the DLL
+//             keepalive goes stale (no client for idleTimeoutMs)
 //
-// The IMFVirtualCamera registration is dynamic: it exists only while a
-// physical PS3 Eye occupies this slot, so apps see exactly as many "PS3 Eye"
-// cameras as are plugged in. Arrival/removal is signaled by the tray window's
+// The IMFVirtualCamera registration is dynamic: it exists only while a physical
+// camera occupies this slot, and is advertised under that device's own name, so
+// apps see exactly the cameras that are plugged in. Arrival/removal is signaled
+// by the tray window's
 // device-interface notification through NotifyDeviceChange(), with a slow
 // fallback poll while the slot is empty.
 //
@@ -25,6 +29,7 @@
 //
 #include <windows.h>
 #include <atomic>
+#include <string>
 #include "../common/Settings.h"
 
 class CaptureController
@@ -38,6 +43,7 @@ public:
         Streaming,
         CameraMissing,  // PS3 Eye not found / unplugged (retrying)
         VCamFailed,     // MFCreateVirtualCamera/Start failing (retrying)
+        Ps4NeedsReplug, // PS4 present but its firmware session is wedged (replug)
         Fatal,          // unrecoverable (e.g. shared memory creation failed)
     };
 
@@ -57,6 +63,27 @@ public:
     bool     HasPendingModeChange() const { return _pendingMode.load(std::memory_order_relaxed); }
     // Capture rate over the last measurement window, x10 (594 == 59.4 fps).
     uint32_t MeasuredFpsX10() const { return _fpsX10.load(std::memory_order_relaxed); }
+
+    // ---- microphone (PS4 only; see ICameraDevice::AudioChannels) ----------
+    // The camera thread owns the device, so the UI cannot call it directly.
+    // Levels are published into atomics once per captured frame, and recording
+    // is a flag the thread observes — no locks on the UI side.
+    static const uint32_t kMicMaxChannels = 4;
+
+    // 0 when the selected camera has no in-band microphone.
+    uint32_t MicChannels() const { return _micChannels.load(std::memory_order_relaxed); }
+    // Per-channel RMS 0..1 from the most recent captured frame.
+    void     MicLevels(float* out, uint32_t count) const;
+    bool     MicRecording() const { return _micRecording.load(std::memory_order_relaxed); }
+    uint32_t MicRecordedSeconds() const { return _micRecSecs.load(std::memory_order_relaxed); }
+    uint32_t MicDropouts() const { return _micDropouts.load(std::memory_order_relaxed); }
+    // Begin writing a 4-channel WAV; returns the chosen path (empty on failure).
+    // Path of the most recent recording, empty until one is started. Written by
+    // MicStartRecording and read by the dialog, both on the UI thread.
+    const std::wstring& MicRecordingPath() const { return _micRecPath; }
+    std::wstring MicStartRecording();
+    void         MicStopRecording() { _micRecording.store(false, std::memory_order_release); }
+
     Settings ActiveSettings() const;
 
     // In-process request from the Settings dialog preview to keep the camera
@@ -76,6 +103,12 @@ public:
     {
         return _previewHold.load(std::memory_order_relaxed) &&
                !_externalClient.load(std::memory_order_relaxed);
+    }
+
+    // An app outside this process is consuming frames right now.
+    bool HasExternalClient() const
+    {
+        return _externalClient.load(std::memory_order_relaxed);
     }
 
 private:
@@ -99,9 +132,22 @@ private:
     std::atomic<bool>     _settingsDirty{ false };
     std::atomic<bool>     _pendingMode{ false };
     std::atomic<bool>     _previewHold{ false };
+    // Mic-only wake: set while this slot's camera HAS a microphone array and the
+    // user has chosen an output to render it to. Keeps the camera streaming with
+    // no video client at all, because the PS4's array rides inside the video
+    // stream and would otherwise go silent ~3 s after the last app closed.
+    // Decided in two places (the capture pump, and the Asleep pass which is the
+    // only one that runs when there is nothing to pump) — see clientFresh().
+    std::atomic<bool>     _micHold{ false };
     std::atomic<bool>     _externalClient{ false };  // fresh ControlBus keepalive
     std::atomic<uint32_t> _fpsX10{ 0 };
-};
 
-// printf when a console is attached (--console) + OutputDebugString always.
-void HostLog(const wchar_t* fmt, ...);
+    // microphone state (see the accessors above)
+    std::atomic<uint32_t> _micChannels{ 0 };
+    std::atomic<uint32_t> _micLevel[kMicMaxChannels] = {};   // RMS * 10000
+    std::atomic<bool>     _micRecording{ false };
+    std::atomic<uint32_t> _micRecSecs{ 0 };
+    std::atomic<uint32_t> _micDropouts{ 0 };
+    std::wstring          _micRecPath;                       // set before the flag
+
+};

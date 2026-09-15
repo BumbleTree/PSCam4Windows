@@ -49,6 +49,10 @@ public:
     // preview-hold flags; the worker re-opens the source on its next loop.
     void SetCamera(int cameraIndex);
 
+    // Move the cell the image is fitted into. The layout owns the cell, so it
+    // must be able to change it -- on a camera change, or a DPI change.
+    void SetCell(const RECT& cellPx);
+
     // CaptureController array base (indexed by cameraIndex) — used to toggle
     // the in-process preview-hold flag that keeps the camera awake while the
     // dialog is open.

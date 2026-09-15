@@ -8,12 +8,12 @@
 #include "EyeToyUsb.h"
 #include "../../host/DeviceProfiles.h"
 #include "../../common/FrameBus.h"   // framebus::kMaxJpegBytes, Yuy2Bytes
+#include "../../common/Yuv.h"
 #include "../../third_party/libjpeg-turbo/include/turbojpeg.h"
 
 namespace {
 
-// iso ring parameters — promoted verbatim from tools/eyetoy_probe.cpp, which
-// validated sustained streaming on hardware (EP 0x81, alt 4).
+// Iso ring parameters for sustained streaming on EP 0x81, alt 4.
 constexpr uint8_t kIsoEp      = 0x81;
 constexpr int     kIsoPkts    = 32;
 constexpr int     kIsoPktSize = 896;
@@ -22,9 +22,8 @@ constexpr int     kIsoRing    = 8;
 void SleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
 // ---------------------------------------------------------------------------
-// OV519 + OV7648 register bring-up — ported VERBATIM from the Linux gspca
-// ov519 driver via tools/eyetoy_probe.cpp (proven on hardware). reg_w/reg_r/
-// i2c primitives + the QVGA/VGA mode tables.
+// OV519 + OV7648 register bring-up from the Linux gspca ov519 driver:
+// register and I2C primitives plus the QVGA/VGA mode tables.
 // ---------------------------------------------------------------------------
 
 int RegW(libusb_device_handle* h, uint16_t index, uint8_t value)
@@ -151,9 +150,7 @@ void StopSensor(libusb_device_handle* h)
 
 void FillYuy2Black(uint8_t* dst, uint32_t w, uint32_t h)
 {
-    uint32_t* p = reinterpret_cast<uint32_t*>(dst);
-    const size_t words = static_cast<size_t>(w) * h / 2;
-    for (size_t i = 0; i < words; ++i) p[i] = 0x80108010u;  // Y=0x10 U/V=0x80
+    yuv::FillBlack(dst, w, h);   // _yuy2Out is allocated at exactly w*h*2
 }
 
 } // namespace
