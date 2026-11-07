@@ -120,9 +120,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
-    const bool uninstall = HasArg(argc, argv, L"--uninstall");
-    const std::wstring originalExe = ArgValue(argc, argv, L"--relaunched");
+    const bool uninstall = argv && HasArg(argc, argv, L"--uninstall");
+    const std::wstring originalExe = argv ? ArgValue(argc, argv, L"--relaunched") : std::wstring();
     const bool isTempCopy = !originalExe.empty();
+    LocalFree(argv);
 
     const std::wstring selfPath = ops::ModulePath();
     const std::wstring selfDir = ops::DirName(selfPath);

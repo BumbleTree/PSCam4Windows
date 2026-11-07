@@ -2,6 +2,7 @@
 // MediaSource / MediaStream implementation. See VCamSource.h for the overview.
 //
 #include "VCamSource.h"
+#include "../common/BlackJpeg.h"
 #include <cstdarg>
 #include <cstdio>
 
@@ -25,16 +26,6 @@ MediaStream::MediaStream(MediaSource* parent, int cameraIndex) : _parent(parent)
 {
     DllAddRef();
 }
-
-namespace
-{
-
-void FillYuy2Black(uint8_t* dst, uint32_t w, uint32_t h)
-{
-    yuv::FillBlack(dst, w, h);   // buffers here are exactly w*h*2
-}
-
-} // namespace
 
 HRESULT MediaStream::Initialize()
 {
@@ -65,7 +56,7 @@ HRESULT MediaStream::Initialize()
     _fpsDen = defaultFpsDen;
     _subtype = MFVideoFormat_NV12;
     _frameBytes = framebus::Nv12Bytes(_width, _height);
-    _frameDuration = MulDiv(10000000, _fpsDen, _fpsNum);
+    _frameDuration = static_cast<LONGLONG>(10000000ull * _fpsDen / _fpsNum);
 
     // _staging always holds the frame in YUY2 (the bus/native format) at the
     // negotiated size; NV12 clients are converted at delivery time.
@@ -117,15 +108,14 @@ HRESULT MediaStream::Initialize()
             return E_OUTOFMEMORY;
     }
 
-    // Per-transport default subtype (NV12 for PS3 Eye, YUY2 for EyeToy).
+    // The device's preferred subtype, published by the host in the ColdBlock.
     const GUID defaultSubtype =
         (cold.defaultFormat == framebus::kFmtYUY2)  ? MFVideoFormat_YUY2 :
         (cold.defaultFormat == framebus::kFmtMJPEG) ? MFVideoFormat_MJPG :
                                                       MFVideoFormat_NV12;
 
-    // Fixed emit order so an unchanged device (PS3 Eye, mask YUY2|NV12) advertises
-    // the identical NV12-then-YUY2 ordering it always has; only formats present in
-    // the mode's mask are created.
+    // Fixed emit order per mode (NV12, then YUY2, then MJPEG); only formats
+    // present in the mode's mask are created.
     struct FmtMap { uint32_t bit; GUID subtype; };
     static const FmtMap kFmts[] = {
         { framebus::kFmtNV12,  MFVideoFormat_NV12 },
@@ -141,8 +131,8 @@ HRESULT MediaStream::Initialize()
     // A raw (uncompressed) type may only be advertised at a size DeliverSample
     // can actually PRODUCE from the current bus frame: the bus size itself, or
     // the single scaled pair the DLL implements (320x240 <-> 640x480). Every
-    // other size falls into DeliverSample's `else` branch and is filled with
-    // FillYuy2Black — so advertising it hands the client a media type that can
+    // other size falls into DeliverSample's Unsupported branch and is filled
+    // with black — so advertising it hands the client a media type that can
     // only ever show black, at full frame rate, with nothing to indicate why.
     //
     // Advertise only what the pipeline can deliver at the CONFIGURED camera mode
@@ -271,7 +261,7 @@ HRESULT MediaStream::CreateMediaType(uint32_t width, uint32_t height, uint32_t f
 
 void MediaStream::FillBlack()
 {
-    FillYuy2Black(_staging.get(), _width, _height);
+    yuv::FillBlack(_staging.get(), _width, _height);   // staging is exactly w*h*2
 }
 
 // Stamp the keepalive (and optionally pulse the wake event) so the host knows
@@ -310,6 +300,7 @@ static uint32_t ConsumerBitForSubtype(const GUID& subtype)
 
 HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
 {
+    AutoLock deliverLock(_deliverLock);
     AutoLock lock(_lock);
     if (_shutdown)
         return MF_E_SHUTDOWN;
@@ -325,16 +316,23 @@ HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
     if (SUCCEEDED(_descriptor->GetMediaTypeHandler(&handler)) &&
         SUCCEEDED(handler->GetCurrentMediaType(&currentType)))
     {
-        MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &width, &height);
-        MFGetAttributeRatio(currentType.Get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen);
-        subtype = MFVideoFormat_NV12;
-        currentType->GetGUID(MF_MT_SUBTYPE, &subtype);
+        if (FAILED(MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &width, &height)) ||
+            FAILED(MFGetAttributeRatio(currentType.Get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen)) ||
+            FAILED(currentType->GetGUID(MF_MT_SUBTYPE, &subtype)))
+            return MF_E_INVALIDMEDIATYPE;
     }
 
+    if (!framebus::ValidDimensions(width, height, framebus::kAbsMaxFrameBytes) ||
+        !framebus::ValidRate(fpsNum, fpsDen) ||
+        (subtype != MFVideoFormat_NV12 && subtype != MFVideoFormat_YUY2 && subtype != MFVideoFormat_MJPG) ||
+        (subtype == MFVideoFormat_MJPG && !_jpegStaging))
+        return MF_E_INVALIDMEDIATYPE;
     std::shared_ptr<uint8_t[]> staging(new (std::nothrow) uint8_t[framebus::Yuy2Bytes(width, height)]);
     if (!staging)
         return E_OUTOFMEMORY;
-    FillYuy2Black(staging.get(), width, height);
+    yuv::FillBlack(staging.get(), width, height);
+    std::vector<uint8_t> black;
+    if (subtype == MFVideoFormat_MJPG && !jpeg::Black(width, height, black)) return E_OUTOFMEMORY;
 
     _width = width;
     _height = height;
@@ -344,8 +342,11 @@ HRESULT MediaStream::Start(const PROPVARIANT* startPosition)
     _consumerMask = ConsumerBitForSubtype(subtype);  // host gates JPEG sidecar on this
     _frameBytes = (subtype == MFVideoFormat_YUY2) ? framebus::Yuy2Bytes(width, height)
                                                   : framebus::Nv12Bytes(width, height);
-    _frameDuration = MulDiv(10000000, fpsDen, fpsNum);
+    _frameDuration = static_cast<LONGLONG>(10000000ull * fpsDen / fpsNum);
     _staging = std::move(staging);
+    _blackJpeg = std::move(black);
+    _lastJpegLen = 0;
+    ++_generation;
     _state = MF_STREAM_STATE_RUNNING;
     _lastFrameId = 0;  // re-sync with whatever the bus currently holds
 
@@ -361,6 +362,7 @@ HRESULT MediaStream::Stop()
     if (_shutdown)
         return MF_E_SHUTDOWN;
     _state = MF_STREAM_STATE_STOPPED;
+    ++_generation;
     _consumerMask = 0;
     _ping.SetConsumerMask(0);               // no active client consuming this format
     VCamTrace(L"stream: stopped");
@@ -373,6 +375,7 @@ HRESULT MediaStream::Shutdown()
     if (_shutdown)
         return S_OK;
     _shutdown = true;
+    ++_generation;
     _state = MF_STREAM_STATE_STOPPED;
     _consumerMask = 0;
     _ping.SetConsumerMask(0);               // client gone; stop gating work on it
@@ -487,6 +490,7 @@ STDMETHODIMP MediaStream::GetStreamDescriptor(IMFStreamDescriptor** ppStreamDesc
 
 STDMETHODIMP MediaStream::RequestSample(IUnknown* pToken)
 {
+    uint64_t generation;
     {
         AutoLock lock(_lock);
         if (_shutdown)
@@ -494,15 +498,16 @@ STDMETHODIMP MediaStream::RequestSample(IUnknown* pToken)
         if (_state != MF_STREAM_STATE_RUNNING)
             return MF_E_MEDIA_SOURCE_WRONGSTATE;
         PingActivity(false);
+        generation = _generation;
     }
-    return DeliverSample(pToken);
+    return DeliverSample(pToken, generation);
 }
 
-HRESULT MediaStream::DeliverSample(IUnknown* token)
+HRESULT MediaStream::DeliverSample(IUnknown* token, uint64_t generation)
 {
     // Serialize deliveries: the staging buffers below belong to exactly one
-    // in-flight DeliverSample at a time. _deliverLock is never taken by any
-    // other method, so Start/Stop/Shutdown can't block on a delivery.
+    // in-flight DeliverSample at a time. Start takes the same lock before
+    // replacing caches; Stop and Shutdown cancel through the generation.
     AutoLock deliverLock(_deliverLock);
 
     // Snapshot the negotiated format and the staging buffer under the object
@@ -518,7 +523,7 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         AutoLock lock(_lock);
         if (_shutdown)
             return MF_E_SHUTDOWN;
-        if (_state != MF_STREAM_STATE_RUNNING)
+        if (_state != MF_STREAM_STATE_RUNNING || _generation != generation)
             return MF_E_MEDIA_SOURCE_WRONGSTATE;
         subtype       = _subtype;
         width         = _width;
@@ -535,10 +540,10 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
 
     // Pace delivery to the camera: wait for a frame newer than the last one
     // we handed out, sleeping on the writer's frame-ready event between
-    // attempts (Sleep-based polling was quantized to the 15.6ms system timer
-    // and silently capped the 100..187fps modes). On deadline we re-deliver
-    // the previous frame so the pipeline keeps flowing even if the host
-    // stalls or exits.
+    // attempts (Sleep-based polling is quantized to the 15.6 ms system timer
+    // and would silently cap the high-frame-rate modes). On deadline we
+    // re-deliver the previous frame so the pipeline keeps flowing even if the
+    // host stalls or exits.
     const DWORD periodMs = static_cast<DWORD>(frameDuration / 10000);
     const ULONGLONG deadline = GetTickCount64() + periodMs * 2 + 50;
 
@@ -548,7 +553,7 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
             AutoLock lock(_lock);
             if (_shutdown)
                 return MF_E_SHUTDOWN;
-            if (_state != MF_STREAM_STATE_RUNNING)
+            if (_state != MF_STREAM_STATE_RUNNING || _generation != generation)
                 return MF_E_MEDIA_SOURCE_WRONGSTATE;
         }
         if (!_bus.IsOpen())
@@ -582,7 +587,7 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
                         const LONG64 id = _bus.TryReadNewer(
                             nullptr, busFrameBytes,
                             _jpegStaging.get(), framebus::kMaxJpegBytes, jpegLen,
-                            lastFrameId);
+                            lastFrameId, busWidth, busHeight);
                         if (id != 0 && jpegLen != 0)
                         {
                             _lastFrameId.store(id, std::memory_order_relaxed);
@@ -593,7 +598,7 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
                 }
                 else if (busWidth == width && busHeight == height)
                 {
-                    const LONG64 id = _bus.TryReadNewer(staging.get(), busFrameBytes, lastFrameId);
+                    const LONG64 id = _bus.TryReadNewer(staging.get(), busFrameBytes, lastFrameId, busWidth, busHeight);
                     if (id != 0)
                     {
                         _lastFrameId.store(id, std::memory_order_relaxed);
@@ -612,12 +617,12 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
                                   L"stream's scratch is %u bytes; re-register to resize",
                                   busWidth, busHeight, busFrameBytes, _busStagingBytes);
                     }
-                    FillYuy2Black(staging.get(), width, height);
+                    yuv::FillBlack(staging.get(), width, height);
                     break;
                 }
                 else
                 {
-                    const LONG64 id = _bus.TryReadNewer(_busStaging.get(), busFrameBytes, lastFrameId);
+                    const LONG64 id = _bus.TryReadNewer(_busStaging.get(), busFrameBytes, lastFrameId, busWidth, busHeight);
                     if (id != 0)
                     {
                         _lastFrameId.store(id, std::memory_order_relaxed);
@@ -646,7 +651,7 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
                                           L"(stale media types; host must re-register on a "
                                           L"resolution change)", width, height, busWidth, busHeight);
                             }
-                            FillYuy2Black(staging.get(), width, height);
+                            yuv::FillBlack(staging.get(), width, height);
                             break;
                         }
                         break;
@@ -666,14 +671,8 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
     }
 
     // MJPEG samples are variable-size (the JFIF length); YUY2/NV12 are fixed.
-    const DWORD outBytes = isMjpeg ? _lastJpegLen : frameBytes;
-    if (isMjpeg && outBytes == 0)
-    {
-        // No JFIF available yet (cold start before the first frame, or host
-        // absent). Skip this delivery rather than emit a malformed JPEG; the
-        // client will request another sample.
-        return S_OK;
-    }
+    const bool blackJpeg = isMjpeg && _lastJpegLen == 0;
+    const DWORD outBytes = isMjpeg ? (blackJpeg ? static_cast<DWORD>(_blackJpeg.size()) : _lastJpegLen) : frameBytes;
 
     ComPtr<IMFSample> sample;
     ComPtr<IMFMediaBuffer> buffer;
@@ -689,7 +688,7 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
             if (isMjpeg)
             {
                 // Passthrough: hand the source JFIF to the client untouched.
-                memcpy(data, _jpegStaging.get(), outBytes);
+                memcpy(data, blackJpeg ? _blackJpeg.data() : _jpegStaging.get(), outBytes);
             }
             else if (subtype == MFVideoFormat_YUY2)
             {
@@ -705,8 +704,8 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         }
     }
     if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());
-    if (SUCCEEDED(hr)) hr = sample->SetSampleTime(MFGetSystemTime());
     if (SUCCEEDED(hr)) hr = sample->SetSampleDuration(frameDuration);
+    if (SUCCEEDED(hr) && isMjpeg) hr = sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
     if (SUCCEEDED(hr) && token)
         hr = sample->SetUnknown(MFSampleExtension_Token, token);
 
@@ -715,8 +714,12 @@ HRESULT MediaStream::DeliverSample(IUnknown* token)
         AutoLock lock(_lock);
         if (_shutdown)
             return MF_E_SHUTDOWN;
-        if (_state != MF_STREAM_STATE_RUNNING)
+        if (_state != MF_STREAM_STATE_RUNNING || _generation != generation)
             return MF_E_MEDIA_SOURCE_WRONGSTATE;
+        const LONGLONG now = MFGetSystemTime();
+        _lastTimestamp = now > _lastTimestamp ? now : _lastTimestamp + 1;
+        hr = sample->SetSampleTime(_lastTimestamp);
+        if (FAILED(hr)) return hr;
         hr = _queue->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, sample.Get());
     }
     return hr;
@@ -793,13 +796,13 @@ HRESULT MediaSource::Initialize(IMFAttributes* activationAttributes)
     if (!_stream)
         return E_OUTOFMEMORY;
     hr = _stream->Initialize();
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) { Shutdown(); return hr; }
 
     IMFStreamDescriptor* descriptors[] = { _stream->Descriptor() };
     hr = MFCreatePresentationDescriptor(1, descriptors, &_pd);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) { Shutdown(); return hr; }
     hr = _pd->SelectStream(0);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) { Shutdown(); return hr; }
 
     VCamTrace(L"source: initialized");
     return S_OK;

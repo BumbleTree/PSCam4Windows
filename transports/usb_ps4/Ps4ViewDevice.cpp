@@ -12,13 +12,15 @@ namespace {
 // Copy a w x h YUY2 plane to dst with optional flips. No flip is a plain memcpy
 // (the hot path); flipV reverses row order; flipH reverses the macropixel order
 // within each row, swapping Y0/Y1 so the YUY2 packing stays valid.
-void Yuy2View(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h, bool flipH, bool flipV)
+void Yuy2View(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h, bool flipH, bool flipV,
+              size_t dstStride = 0)
 {
     const size_t rowBytes = (size_t)w * 2;
+    if (!dstStride) dstStride = rowBytes;
     for (uint32_t y = 0; y < h; ++y)
     {
         const uint8_t* s = src + (size_t)(flipV ? (h - 1 - y) : y) * rowBytes;
-        uint8_t*       o = dst + (size_t)y * rowBytes;
+        uint8_t*       o = dst + (size_t)y * dstStride;
         if (!flipH) { memcpy(o, s, rowBytes); continue; }
         const uint32_t macros = w / 2;                 // each = Y0 U Y1 V
         for (uint32_t j = 0; j < macros; ++j)
@@ -38,6 +40,7 @@ Ps4ViewDevice::~Ps4ViewDevice()
 
 bool Ps4ViewDevice::Init(const VideoMode& mode)
 {
+    _settingsOk = true;
     _source = ps4::Ps4CaptureSource::Acquire(_portPath);
     if (!_source)
         return false;
@@ -52,8 +55,8 @@ bool Ps4ViewDevice::Init(const VideoMode& mode)
     if (_useIsp)
     {
         const uint32_t wantEyeW = (_view == Ps4ViewKind::SideBySide) ? mode.width / 2 : mode.width;
-        if (_ownsControls)
-            _source->RequestGeometry(wantEyeW, mode.height, mode.fps);
+        if (!_source->RequestGeometry(wantEyeW, mode.height, mode.fps, !_ownsControls))
+            return false;
         const ps4::IspGeometry g = _source->Geometry();
         _width  = (_view == Ps4ViewKind::SideBySide) ? g.eyeW * 2 : g.eyeW;
         _height = g.eyeH;
@@ -75,10 +78,7 @@ bool Ps4ViewDevice::Init(const VideoMode& mode)
     // Black-fill so a client attaching before the first frame sees clean black.
     yuv::FillBlack(_yuy2Out.get(), 2 * ps4::kEyeWidth, ps4::kEyeHeight, maxOut);
 
-    // Both eyes always (any view can be selected live). The per-eye SBS stitch
-    // scratch (_eyeYuyvL/_eyeYuyvR, ~2 MB each) is allocated lazily on first
-    // Side-by-side render — a single-eye view, and every split half (which can never
-    // present SBS), never touches it, so it isn't reserved here.
+    // Both eyes are reserved because the view can change without reallocating.
     _bayerL.assign(ps4::kEyeBayerBytes, 0);
     _bayerR.assign(ps4::kEyeBayerBytes, 0);
     _toneL.Reset();
@@ -94,6 +94,7 @@ bool Ps4ViewDevice::Init(const VideoMode& mode)
 bool Ps4ViewDevice::SetView(int viewKind)
 {
     const Ps4ViewKind v = static_cast<Ps4ViewKind>(viewKind);
+    if (v != Ps4ViewKind::Left && v != Ps4ViewKind::Right && v != Ps4ViewKind::SideBySide) return false;
     _view = v;
     const ps4::IspGeometry g = _source ? _source->Geometry() : ps4::DefaultIspGeometry();
     _width  = (v == Ps4ViewKind::SideBySide) ? g.eyeW * 2 : g.eyeW;
@@ -103,7 +104,7 @@ bool Ps4ViewDevice::SetView(int viewKind)
 
 bool Ps4ViewDevice::Start()
 {
-    if (!_source || _streaming)
+    if (!_source || _streaming || !_settingsOk)
         return false;
     if (!_source->StartStreaming())
         return false;
@@ -122,7 +123,7 @@ void Ps4ViewDevice::Stop()
 
 bool Ps4ViewDevice::AcquireFrame(AcquiredFrame& out, uint32_t timeoutMs, bool /*wantJpeg*/)
 {
-    if (!_source)
+    if (!_source || !_settingsOk)
         return false;
 
     // Block up to timeoutMs for a frame newer than the one we last rendered.
@@ -130,13 +131,14 @@ bool Ps4ViewDevice::AcquireFrame(AcquiredFrame& out, uint32_t timeoutMs, bool /*
     if (seq == _lastSeq)
         return false;   // nothing new within the timeout
 
+    ps4::Ps4CaptureSource::FrameSnapshot snapshot{};
     const uint64_t got =
-        (_view == Ps4ViewKind::Left)  ? _source->SnapshotPlanes(_bayerL.data(), nullptr)
-      : (_view == Ps4ViewKind::Right) ? _source->SnapshotPlanes(nullptr, _bayerR.data())
-                                      :  _source->SnapshotPlanes(_bayerL.data(), _bayerR.data());
+        (_view == Ps4ViewKind::Left)  ? _source->SnapshotPlanes(_bayerL.data(), nullptr, &snapshot)
+      : (_view == Ps4ViewKind::Right) ? _source->SnapshotPlanes(nullptr, _bayerR.data(), &snapshot)
+                                      :  _source->SnapshotPlanes(_bayerL.data(), _bayerR.data(), &snapshot);
     if (got == 0)
         return false;   // no frame assembled yet
-    _lastSeq = seq;
+    _lastSeq = got;
 
     // In ISP mode the snapshotted planes are already calibrated YUY2 from the
     // OV580 ISP, so the view just copies (and optionally flips) them — no
@@ -144,16 +146,20 @@ bool Ps4ViewDevice::AcquireFrame(AcquiredFrame& out, uint32_t timeoutMs, bool /*
     // Per-eye size comes from the engine's committed mode, not a constant: the
     // OV580 delivers 1280x800, 640x400 and 320x192 and every buffer here is
     // sized for the largest, so the smaller modes use a prefix.
-    const ps4::IspGeometry g = _source->Geometry();
+    const ps4::IspGeometry g = snapshot.geometry;
     const uint32_t eyeW = _useIsp ? g.eyeW : ps4::kEyeWidth;
     const uint32_t eyeH = _useIsp ? g.eyeH : ps4::kEyeHeight;
+    _width = (_view == Ps4ViewKind::SideBySide) ? eyeW * 2 : eyeW;
+    _height = eyeH;
+    if (_useIsp)
+        _fps = g.fps;   // RAW keeps the rate Init chose: its geometry is the ISP default
 
     if (_view == Ps4ViewKind::Left)
     {
         if (_useIsp)
             Yuy2View(_bayerL.data(), _yuy2Out.get(), eyeW, eyeH, _flipH, _flipV);
         else
-            ps4::DemosaicBggrToYuy2(_bayerL.data(), ps4::kEyeWidth, ps4::kEyeHeight,
+            ps4::DemosaicGrbgToYuy2(_bayerL.data(), ps4::kEyeWidth, ps4::kEyeHeight,
                                     _yuy2Out.get(), _toneL, _flipH, _flipV);
     }
     else if (_view == Ps4ViewKind::Right)
@@ -161,32 +167,29 @@ bool Ps4ViewDevice::AcquireFrame(AcquiredFrame& out, uint32_t timeoutMs, bool /*
         if (_useIsp)
             Yuy2View(_bayerR.data(), _yuy2Out.get(), eyeW, eyeH, _flipH, _flipV);
         else
-            ps4::DemosaicBggrToYuy2(_bayerR.data(), ps4::kEyeWidth, ps4::kEyeHeight,
+            ps4::DemosaicGrbgToYuy2(_bayerR.data(), ps4::kEyeWidth, ps4::kEyeHeight,
                                     _yuy2Out.get(), _toneR, _flipH, _flipV);
     }
-    else // SideBySide -> [Left | Right] in one 2560x800 frame
+    else if (_useIsp)
+    {
+        const size_t stride = static_cast<size_t>(_width) * 2;
+        Yuy2View(_bayerL.data(), _yuy2Out.get(), eyeW, eyeH, _flipH, _flipV, stride);
+        Yuy2View(_bayerR.data(), _yuy2Out.get() + eyeW * 2, eyeW, eyeH, _flipH, _flipV, stride);
+    }
+    else // RAW side-by-side demosaics each eye before composition.
     {
         // Lazy-allocate the per-eye stitch scratch on first SBS render (Init skips
-        // it, so single-eye and split views never reserve it).
+        // it, so single-eye, split and ISP views never reserve it).
         if (_eyeYuyvL.empty())
         {
-            // Always the LARGEST eye, so a live mode change never reallocates.
             const size_t eyeBytes = framebus::Yuy2Bytes(ps4::kEyeWidth, ps4::kEyeHeight);
             _eyeYuyvL.assign(eyeBytes, 0);
             _eyeYuyvR.assign(eyeBytes, 0);
         }
-        if (_useIsp)
-        {
-            Yuy2View(_bayerL.data(), _eyeYuyvL.data(), eyeW, eyeH, _flipH, _flipV);
-            Yuy2View(_bayerR.data(), _eyeYuyvR.data(), eyeW, eyeH, _flipH, _flipV);
-        }
-        else
-        {
-            ps4::DemosaicBggrToYuy2(_bayerL.data(), ps4::kEyeWidth, ps4::kEyeHeight,
-                                    _eyeYuyvL.data(), _toneL, _flipH, _flipV);
-            ps4::DemosaicBggrToYuy2(_bayerR.data(), ps4::kEyeWidth, ps4::kEyeHeight,
-                                    _eyeYuyvR.data(), _toneR, _flipH, _flipV);
-        }
+        ps4::DemosaicGrbgToYuy2(_bayerL.data(), ps4::kEyeWidth, ps4::kEyeHeight,
+                                _eyeYuyvL.data(), _toneL, _flipH, _flipV);
+        ps4::DemosaicGrbgToYuy2(_bayerR.data(), ps4::kEyeWidth, ps4::kEyeHeight,
+                                _eyeYuyvR.data(), _toneR, _flipH, _flipV);
         const size_t halfRow = (size_t)eyeW * 2;             // bytes per eye row
         const size_t fullRow = (size_t)_width * 2;           // both eyes
         for (uint32_t y = 0; y < eyeH; ++y)
@@ -201,6 +204,7 @@ bool Ps4ViewDevice::AcquireFrame(AcquiredFrame& out, uint32_t timeoutMs, bool /*
     out.yuy2Bytes = framebus::Yuy2Bytes(_width, _height);
     out.jpeg      = nullptr;
     out.jpegBytes = 0;
+    out.mode = VideoMode{ _width, _height, _fps };
     return true;
 }
 
@@ -212,11 +216,10 @@ void Ps4ViewDevice::ApplySettings(const Settings& s)
     _flipH = s.flipH;
     _flipV = s.flipV;
 
-    // ISP camera controls (auto-exposure / gain / exposure / brightness). autoGain
-    // also drives auto-exposure (per Settings). Pushed to the shared source, which
-    // applies them live or at the next bring-up. (No effect in RAW mode.) Only the
-    // home view owns the shared ISP's controls; a split pair's Right half skips this
-    // so the two halves don't fight over the single physical control state.
+    // ISP camera controls. Pushed to the shared source, which applies them live
+    // or at the next bring-up. (No effect in RAW mode.) Only the home view owns
+    // the shared ISP's controls; a split pair's Right half skips this so the two
+    // halves don't fight over the single physical control state.
     if (_source && _ownsControls)
     {
         ps4::Ps4CaptureSource::IspControls c;
@@ -231,7 +234,8 @@ void Ps4ViewDevice::ApplySettings(const Settings& s)
         _source->SetControls(c);
         // Separate from SetControls because it is not a live control: writing it
         // needs the stream stopped, so it no-ops unless the value changed.
-        _source->SetMicGain(s.micGain);
+        // False only when the stream itself was lost restoring the old gain.
+        _settingsOk = _source->SetMicGain(s.micGain);
     }
 }
 

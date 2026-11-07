@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <thread>
 
@@ -30,14 +31,13 @@ const IspGeometry kIspGeometries[] = {
     IspGeometry{ 3,  83333,   898, 200,  320, 192, 120 },
     IspGeometry{ 3, 166666,   898, 200,  320, 192,  60 },
 };
-const int kIspGeometryCount = (int)(sizeof(kIspGeometries) / sizeof(kIspGeometries[0]));
+const int kIspGeometryCount = static_cast<int>(std::size(kIspGeometries));
 
 const IspGeometry* FindIspGeometry(uint32_t eyeW, uint32_t eyeH, uint32_t fps)
 {
-    for (int i = 0; i < kIspGeometryCount; ++i)
-        if (kIspGeometries[i].eyeW == eyeW && kIspGeometries[i].eyeH == eyeH &&
-            kIspGeometries[i].fps == fps)
-            return &kIspGeometries[i];
+    for (const IspGeometry& g : kIspGeometries)
+        if (g.eyeW == eyeW && g.eyeH == eyeH && g.fps == fps)
+            return &g;
     return nullptr;
 }
 
@@ -101,9 +101,11 @@ void SleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)
 inline void Put16(uint8_t* b, uint16_t v) { b[0] = v & 0xff; b[1] = v >> 8; }
 inline void Put32(uint8_t* b, uint32_t v) { b[0]=v&0xff; b[1]=(v>>8)&0xff; b[2]=(v>>16)&0xff; b[3]=(v>>24)&0xff; }
 
-// Find the Camera Terminal entity id (ITT_CAMERA) from the VideoControl
-// interface's class-specific descriptors; 0 if not found.
-uint8_t FindCameraTerminal(libusb_device* dev)
+// Walk the VideoControl interface's class-specific (CS_INTERFACE) descriptors
+// and return the entity id (byte 3) of the last one `match` accepts within the
+// first alt setting that has any; 0 if none. `match` sees a descriptor whose
+// bLength (`len`, >= 4) fits inside the buffer.
+uint8_t FindVcEntity(libusb_device* dev, bool (*match)(const uint8_t* p, int len))
 {
     uint8_t id = 0;
     libusb_config_descriptor* cfg = nullptr;
@@ -119,10 +121,9 @@ uint8_t FindCameraTerminal(libusb_device* dev)
             const uint8_t* p = d.extra; int rem = d.extra_length;
             while (rem >= 3)
             {
-                const int len = p[0], type = p[1], sub = p[2];
+                const int len = p[0];
                 if (len < 3 || len > rem) break;
-                if (type == 0x24 && sub == 0x02 /*VC_INPUT_TERMINAL*/ &&
-                    (uint16_t)(p[4] | (p[5] << 8)) == 0x0201 /*ITT_CAMERA*/)
+                if (len >= 4 && p[1] == 0x24 && match(p, len))
                     id = p[3];
                 p += len; rem -= len;
             }
@@ -132,32 +133,18 @@ uint8_t FindCameraTerminal(libusb_device* dev)
     return id;
 }
 
-// Find the Processing Unit entity id from the VideoControl descriptors; 0 if none.
+// VC_INPUT_TERMINAL whose wTerminalType is ITT_CAMERA.
+uint8_t FindCameraTerminal(libusb_device* dev)
+{
+    return FindVcEntity(dev, [](const uint8_t* p, int len) {
+        return p[2] == 0x02 && len >= 6 && (uint16_t)(p[4] | (p[5] << 8)) == 0x0201;
+    });
+}
+
+// VC_PROCESSING_UNIT.
 uint8_t FindProcessingUnit(libusb_device* dev)
 {
-    uint8_t id = 0;
-    libusb_config_descriptor* cfg = nullptr;
-    if (libusb_get_config_descriptor(dev, 0, &cfg) != 0)
-        return 0;
-    for (int i = 0; i < cfg->bNumInterfaces && !id; ++i)
-    {
-        const libusb_interface& itf = cfg->interface[i];
-        for (int a = 0; a < itf.num_altsetting && !id; ++a)
-        {
-            const libusb_interface_descriptor& d = itf.altsetting[a];
-            if (d.bInterfaceClass != 0x0E || d.bInterfaceSubClass != 0x01) continue;
-            const uint8_t* p = d.extra; int rem = d.extra_length;
-            while (rem >= 3)
-            {
-                const int len = p[0], type = p[1], sub = p[2];
-                if (len < 3 || len > rem) break;
-                if (type == 0x24 && sub == 0x05 /*VC_PROCESSING_UNIT*/) id = p[3];
-                p += len; rem -= len;
-            }
-        }
-    }
-    libusb_free_config_descriptor(cfg);
-    return id;
+    return FindVcEntity(dev, [](const uint8_t* p, int) { return p[2] == 0x05; });
 }
 
 // One stalled control request WEDGES the OV580's control pipe: every request
@@ -165,9 +152,8 @@ uint8_t FindProcessingUnit(libusb_device* dev)
 // control written after it. It is therefore ORDER-DEPENDENT: the same probe run
 // in a different sequence reports a different set of "unsupported" controls,
 // and a wall measured through a wedged pipe is not a wall. After any failure,
-// clear the halt
-// and resynchronise with a request the device always answers (VS_PROBE
-// GET_CUR), so the NEXT control write starts from a healthy pipe.
+// clear the halt and resynchronise with a request the device always answers
+// (VS_PROBE GET_CUR), so the NEXT control write starts from a healthy pipe.
 void UvcPipeRecover(libusb_device_handle* h)
 {
     libusb_clear_halt(h, 0x00);
@@ -185,8 +171,8 @@ void UvcPipeRecover(libusb_device_handle* h)
 // the control SETUP packet. Copying those offsets into a libusb_control_transfer
 // payload — which already excludes the setup packet — puts the mode byte inside
 // the first record and the record itself in the third slot. The device ACKs such
-// a transfer and does nothing, which is exactly how the microphone, the LED and
-// the sensor registers all looked like hardware walls for months.
+// a transfer and does nothing, which makes the microphone, the LED and the
+// sensor registers all look like hardware walls.
 int RegWriteMulti(libusb_device_handle* h, const ps4::Ak5703Reg* regs, int n,
                   uint8_t subaddr, uint8_t mode)
 {
@@ -331,9 +317,9 @@ void ReplayStartup(libusb_device_handle* h, const std::vector<uint8_t>& cmds)
 // UsbContext::Instance() BEFORE constructing the map. That forces the libusb
 // context singleton to be constructed first and therefore destroyed LAST — so at
 // process exit the map (and every source's ~CloseDevice, which calls back into
-// UsbContext::Release) tears down while the context is still alive. Without this
-// ordering the namespace-static map outlived the context singleton and the dtor
-// dereferenced freed memory (0xC0000005 on shutdown).
+// UsbContext::Release) tears down while the context is still alive. In the
+// other order the destructors would dereference the freed context and fault on
+// shutdown.
 std::mutex& SourcesMutex()
 {
     static std::mutex m;
@@ -379,7 +365,7 @@ void Ps4CaptureSource::RetireAbsent(const std::vector<std::string>& present)
 }
 
 Ps4CaptureSource::Ps4CaptureSource(std::string portPath)
-    : _portPath(std::move(portPath)), _key(_portPath),
+    : _portPath(std::move(portPath)),
       // YUYV ISP is the default (calibrated colour, auto-exposed, both eyes live,
       // zero-CPU). Set PS4_RAW=1 to fall back to the legacy Bayer demosaic path.
       _useIsp(getenv("PS4_RAW") == nullptr)
@@ -389,13 +375,12 @@ Ps4CaptureSource::Ps4CaptureSource(std::string portPath)
     _pubLeft.assign(kEyeBayerBytes, 0);
     _pubRight.assign(kEyeBayerBytes, 0);
     _geom = DefaultIspGeometry();
-    _eyeBytes.store(_geom.EyeBytes(), std::memory_order_release);
 }
 
 Ps4CaptureSource::~Ps4CaptureSource()
 {
-    // The map (RetireAbsent) owns removal from g_sources; the dtor only releases
-    // USB. Full teardown: cancel iso, release interfaces, close the handle.
+    // RetireAbsent owns removal from Sources(); the dtor only releases USB.
+    // Full teardown: cancel iso, release interfaces, close the handle.
     std::lock_guard<std::mutex> lk(_stateMutex);
     CloseDevice();
 }
@@ -403,23 +388,35 @@ Ps4CaptureSource::~Ps4CaptureSource()
 bool Ps4CaptureSource::StartStreaming()
 {
     std::lock_guard<std::mutex> lk(_stateMutex);
-    if (_awakeUsers++ == 0)
+    // A device that vanished needs a fresh open. A ring that died while the
+    // handle is fine (every transfer completed with an error) only needs
+    // resubmitting -- the handle stays open, which is what the OV580 needs.
+    if (_deviceLost.load(std::memory_order_acquire))
+        CloseDevice();
+    else if (_streaming && _xfersInFlight.load(std::memory_order_acquire) == 0)
+        StopIso();
+    if (!_streaming)
     {
         // Open the device once (firmware + claim + UVC commit); on later wakes the
         // handle is already open, so we only resubmit the iso ring — no close /
         // reopen / alt-toggle, which is what keeps the OV580's session clean.
         if (!_open && !EnsureOpen())
         {
-            _awakeUsers = 0;
             return false;
         }
         if (!StartIso())
         {
-            _awakeUsers = 0;
+            // Reclaim whatever part of the ring was built. Keep the handle unless
+            // the device is gone: one failed submit is not worth a reopen.
+            if (_deviceLost.load(std::memory_order_acquire))
+                CloseDevice();
+            else
+                StopIso();
             return false;
         }
     }
-    return _streaming;
+    ++_awakeUsers;
+    return true;
 }
 
 void Ps4CaptureSource::StopStreaming()
@@ -436,21 +433,23 @@ IspGeometry Ps4CaptureSource::Geometry() const
 }
 
 // Select a delivered mode. Safe to call while the handle is open: the iso ring
-// is stopped around the re-commit, which is exactly the sequence the hardware
-// mode matrix ran ten times in a row (alt 0 -> probe/commit -> alt 1) with no
-// wedge and no replug. Every buffer is already sized for the LARGEST mode, so
-// nothing reallocates and no reader can see a half-resized plane.
-bool Ps4CaptureSource::RequestGeometry(uint32_t eyeW, uint32_t eyeH, uint32_t fps)
+// is stopped around the re-commit (alt 0 -> probe/commit -> alt 1), a sequence
+// that survives repeated mode switches with no wedge and no replug. Every
+// buffer is already sized for the LARGEST mode, so nothing reallocates and no
+// reader can see a half-resized plane.
+bool Ps4CaptureSource::RequestGeometry(uint32_t eyeW, uint32_t eyeH, uint32_t fps, bool onlyIfIdle)
 {
     const IspGeometry* g = FindIspGeometry(eyeW, eyeH, fps);
     if (!g)
         return false;
 
     std::lock_guard<std::mutex> lk(_stateMutex);
+    if (onlyIfIdle && _awakeUsers > 0) return true;
     if (_geom.SameAs(*g) && _geom.eyeW == g->eyeW && _geom.eyeH == g->eyeH)
         return true;                     // already there
 
     const bool wasStreaming = _streaming;
+    const IspGeometry previous = _geom;
     if (_open && _useIsp)
     {
         if (wasStreaming)
@@ -460,21 +459,17 @@ bool Ps4CaptureSource::RequestGeometry(uint32_t eyeW, uint32_t eyeH, uint32_t fp
         _stream.clear();
         _ispFid = -1;
         _geom = *g;
-        _eyeBytes.store(_geom.EyeBytes(), std::memory_order_release);
-        libusb_set_interface_alt_setting(_h, 1, 0);   // zero-bandwidth
-        libusb_set_interface_alt_setting(_h, 1, 1);
-        if (!BringUpIsp())
+        if (!Recommit(false, wasStreaming))
         {
             OutputDebugStringW(L"[PSCam4Win] PS4: mode re-commit failed\n");
+            _geom = previous;
+            RecoverAfterFailedCommit(wasStreaming);
             return false;
         }
-        if (wasStreaming && !StartIso())
-            return false;
     }
     else
     {
         _geom = *g;                      // applied by the next EnsureOpen()
-        _eyeBytes.store(_geom.EyeBytes(), std::memory_order_release);
     }
     return true;
 }
@@ -523,8 +518,9 @@ bool Ps4CaptureSource::EnsureRunningDevice()
 
 // Put the OV580 into YUYV ISP output via standard UVC probe/commit, then turn on
 // auto-exposure (the default leaves the image near-black). Confirmed on hardware:
-// commit FORMAT_INDEX=1 (YUY2) FRAME_INDEX=1 (3448x808@60), then CT_AE_MODE=auto
-// lifts mean luma ~15 -> ~120. Iface 1 alt 1 is already selected by the caller.
+// commit FORMAT_INDEX=1 (YUY2) with the geometry's frame index and interval,
+// then CT_AE_MODE=auto lifts mean luma ~15 -> ~120. Iface 1 alt 1 is already
+// selected by the caller.
 bool Ps4CaptureSource::BringUpIsp()
 {
     // dwMaxVideoFrameSize MUST match the requested frame index. Sending the
@@ -557,15 +553,13 @@ bool Ps4CaptureSource::BringUpIsp()
 
 // Send the cached camera controls to the device (ISP mode). Single control
 // transfers on the VideoControl interface; failures (unsupported selectors) are
-// ignored. Called at bring-up (single-threaded) and live from SetControls.
+// ignored after the pipe recovery in UvcSetCur. Called with _stateMutex held, at
+// bring-up and live from SetControls.
 //
-// Hardware reality on the final firmware: both AE modes
-// the OV580 accepts are AUTO — the shutter-priority(4) path below is accepted
-// on the wire, but the ISP's AE loop compensates exposure/gain writes away
-// (16x exposure swing + max gain moves mean luma ~1%). The PS4 profile therefore
-// advertises neither CTRL_GAIN nor CTRL_EXPOSURE, and the dialog cannot set
-// autoExposure=false; the manual path below survives only so a stale registry
-// value cannot reach the hardware.
+// Hardware reality on the final firmware: both AE modes the OV580 accepts are
+// AUTO. Shutter priority (4) is accepted on the wire, but the ISP's AE loop
+// compensates exposure writes away (a 16x exposure swing moves mean luma ~1%),
+// so the AE mode is always written as auto and no exposure is ever sent.
 void Ps4CaptureSource::ApplyControls()
 {
     if (!_h || !_useIsp)
@@ -576,21 +570,20 @@ void Ps4CaptureSource::ApplyControls()
     // (shutter priority), and BOTH are auto — measured on a healthy control
     // pipe, under mode 4 a deliberately LOW exposure with gain pinned to
     // minimum makes the image BRIGHTER (luma 126 -> 156), because mode 4 just
-    // targets a higher AE setpoint. Selecting it would therefore reintroduce the
-    // very blow-out this camera was reported for, so shutter priority is not
-    // switchable: the PS4 profiles advertise neither CTRL_GAIN nor
-    // CTRL_EXPOSURE, and a stale AutoGain=0 in the registry must not be able to
-    // quietly change the picture. Real exposure control is PU_GAIN below, which
-    // is always live.
+    // targets a higher AE setpoint. Selecting it would blow out highlights, so
+    // shutter priority is not switchable: the PS4 profiles advertise no
+    // auto-gain or exposure control, and a stale AutoGain=0 in the registry
+    // must not be able to quietly change the picture. Real exposure control is
+    // PU_GAIN below, which is always live.
     if (_ctEntity)
     {
         const uint8_t ae = kAeModeAuto;
         UvcSetCur(_h, kCtAeModeCs, _ctEntity, &ae, 1);
     }
 
-    // The always-live ISP controls. All four measurably move the image on the
-    // shipped firmware and none of them needs an "auto off"
-    // mode first — the ISP's AE stays on and these ride on top of it.
+    // The always-live ISP controls. Each measurably moves the image on the
+    // shipped firmware and none of them needs an "auto off" mode first — the
+    // ISP's AE stays on and these ride on top of it.
     if (_puEntity)
     {
         auto put16 = [&](uint8_t cs, long v) {
@@ -619,8 +612,8 @@ void Ps4CaptureSource::ApplyControls()
         put16(kPuSaturationCs, Scale(_ctrl.saturation, 255, UvcGetMax(_h, kPuSaturationCs, _puEntity, 2, 8)));
         put16(kPuSharpnessCs, Scale(_ctrl.sharpness, 255, UvcGetMax(_h, kPuSharpnessCs, _puEntity, 2, 8)));
 
-        // Mains anti-flicker. The ISP powers up on 50 Hz and nothing ever wrote
-        // it, so 60 Hz regions banded with no way out.
+        // Mains anti-flicker. The ISP powers up on 50 Hz, so without this
+        // write 60 Hz regions band.
         {
             const uint8_t pl = (uint8_t)(_ctrl.powerlineFreq > 2 ? 1 : _ctrl.powerlineFreq);
             UvcSetCur(_h, kPuPowerlineCs, _puEntity, &pl, 1);
@@ -694,10 +687,9 @@ bool Ps4CaptureSource::EnsureOpen()
     //
     // So it is selecting the STREAMING ALT SETTING that makes the vendor
     // register channel unreliable, not the commit and not the control traffic
-    // -- which is why moving this inside BringUpIsp() was not enough: by then
-    // alt 1 is already selected. A short write count leaves the array
-    // misconfigured and permanently silent, which is exactly how the
-    // microphone looked like a hardware wall.
+    // -- which is why this cannot live inside BringUpIsp(): by then alt 1 is
+    // already selected. A short write count leaves the array misconfigured and
+    // permanently silent, which looks exactly like a hardware wall.
     Ak5703BringUp();
 
     libusb_set_interface_alt_setting(_h, 1, 1);   // streaming alt; held open hereafter
@@ -721,6 +713,7 @@ bool Ps4CaptureSource::EnsureOpen()
     UsbContext::Instance().Acquire();   // event thread, kept while the handle is open
     _ctxAcquired = true;
     _open = true;
+    _deviceLost.store(false, std::memory_order_release);
     return true;
 }
 
@@ -730,12 +723,20 @@ bool Ps4CaptureSource::StartIso()
 {
     if (_streaming)
         return true;
+    if (_xfersInFlight.load(std::memory_order_acquire) != 0) return false;
+    {
+        std::lock_guard<std::mutex> lk(_latchMutex);
+        ++_generation;
+        _latchValid = false;
+        std::fill(_pubLeft.begin(), _pubLeft.end(), uint8_t(0));
+        std::fill(_pubRight.begin(), _pubRight.end(), uint8_t(0));
+    }
     _stream.clear();
     _frameStart = 0;
     _synced = false;
     _ispFid = -1;
     if (_useIsp)
-        ApplyControls();   // re-assert exposure/gain on each wake
+        ApplyControls();   // re-assert the camera controls on each wake
     // rows/second is mode-dependent, so convert the settle TIME to rows here.
     _micSettleRows = (uint32_t)((uint64_t)kMicSettleMs *
                                 _geom.rows * _geom.fps / 1000);
@@ -744,7 +745,7 @@ bool Ps4CaptureSource::StartIso()
     _micDropouts.store(0, std::memory_order_relaxed);
     _cancelling.store(false, std::memory_order_release);
     SubmitIsoRing();
-    if (_xfers.empty())
+    if (_xfers.empty() || _xfersInFlight.load(std::memory_order_acquire) == 0)
         return false;
     _streaming = true;
     return true;
@@ -755,42 +756,66 @@ bool Ps4CaptureSource::StartIso()
 // clean session instead of forcing a replug.
 void Ps4CaptureSource::StopIso()
 {
-    if (_streaming)
+    // Cancel whatever part of the ring exists (a partly submitted one included),
+    // then wait for every transfer's completion callback to run BEFORE freeing
+    // anything: libusb owns a submitted transfer (and its buffer) until the
+    // callback fires, so freeing one mid-flight is a use-after-free on the event
+    // thread. The event thread is still pumping here (CloseDevice releases it
+    // only AFTER StopIso) and HandleIso treats a cancelled/errored transfer as
+    // terminal. Cancelling a transfer that is not in flight is a harmless no-op.
+    _cancelling.store(true, std::memory_order_release);
+    for (auto* t : _xfers)
+        libusb_cancel_transfer(t);
+    while (_xfersInFlight.load(std::memory_order_acquire) != 0) SleepMs(5);
+    _streaming = false;
+    FreeTransfers();
+    { std::lock_guard<std::mutex> lk(_latchMutex); _latchValid = false; }
     {
-        _cancelling.store(true, std::memory_order_release);
-        for (auto* t : _xfers)
-            libusb_cancel_transfer(t);
-        // Wait for every cancelled transfer's completion callback to run BEFORE
-        // freeing anything: libusb owns a submitted transfer (and its buffer) until
-        // the callback fires, so freeing one mid-flight is a use-after-free on the
-        // event thread. The event thread is still pumping here (CloseDevice releases
-        // it only AFTER StopIso) and HandleIso treats a cancelled/errored transfer as
-        // terminal, so _xfersInFlight drains within an event-loop tick; the long cap
-        // is only a safety valve against a wedged driver that never calls back.
-        for (int i = 0; i < 2000 && _xfersInFlight.load(std::memory_order_acquire) != 0; ++i)
-            SleepMs(5);
-        _streaming = false;
+        std::lock_guard<std::mutex> lk(_micMutex);
+        _micWritePos = _micReadPos = 0;
     }
-    // Free only once nothing is in flight. If a transfer never completed (a wedged
-    // driver — unreachable above), leak the ring in place: that is far safer than
-    // freeing memory libusb may still write to.
-    if (_xfersInFlight.load(std::memory_order_acquire) == 0)
-        FreeTransfers();
-    else
-        OutputDebugStringW(L"[PSCam4Win] PS4: iso transfer never completed -- leaking ring to avoid UAF\n");
+    for (auto& level : _micLevel) level.store(0, std::memory_order_relaxed);
     _stream.clear();
     _frameStart = 0;
     _synced = false;
     _ispFid = -1;
 }
 
+bool Ps4CaptureSource::Recommit(bool writeMicGain, bool restartIso)
+{
+    if (!_h)
+        return false;
+    if (libusb_set_interface_alt_setting(_h, 1, 0) != 0)
+        return false;
+    if (writeMicGain && !WriteMicGain())
+        return false;
+    if (libusb_set_interface_alt_setting(_h, 1, 1) != 0 || !BringUpIsp())
+        return false;
+    if (restartIso && !StartIso())
+    {
+        StopIso();                     // reclaim a partly submitted ring
+        return false;
+    }
+    return true;
+}
+
+bool Ps4CaptureSource::RecoverAfterFailedCommit(bool restartIso)
+{
+    // One failed control transfer can stall the pipe for the next request
+    // too, so the restore gets a second attempt. The state being restored is
+    // one the device was already running.
+    if (!_deviceLost.load(std::memory_order_acquire))
+        for (int attempt = 0; attempt < 2; ++attempt)
+            if (Recommit(true, restartIso))
+                return true;
+    OutputDebugStringW(L"[PSCam4Win] PS4: could not restore the previous stream -- closing\n");
+    CloseDevice();
+    return false;
+}
+
 void Ps4CaptureSource::SubmitIsoRing()
 {
-    // If a previous StopIso leaked the ring (a wedged transfer never called
-    // back), rebuilding here would free/reuse buffers libusb may still write to —
-    // the exact use-after-free the leak avoided. Stay unstreamable (StartIso sees
-    // _xfers empty and fails; the controller retries) until the callback finally
-    // drains the old ring, then reclaim it below before building the new one.
+    // An old pending ring cannot be reported as a newly submitted stream.
     if (_xfersInFlight.load(std::memory_order_acquire) != 0)
         return;
     if (!_xfers.empty())
@@ -814,8 +839,11 @@ void Ps4CaptureSource::SubmitIsoRing()
                                  &Ps4CaptureSource::OnIso, this, 1000);
         libusb_set_iso_packet_lengths(t, maxPkt);
         _xfersInFlight.fetch_add(1, std::memory_order_acq_rel);
-        if (libusb_submit_transfer(t) != 0)
+        const int rc = libusb_submit_transfer(t);
+        if (rc != 0)
         {
+            if (rc == LIBUSB_ERROR_NO_DEVICE)
+                _deviceLost.store(true, std::memory_order_release);
             _xfersInFlight.fetch_sub(1, std::memory_order_acq_rel);
             libusb_free_transfer(t);
             break;
@@ -843,6 +871,7 @@ void Ps4CaptureSource::CloseDevice()
         _h = nullptr;
     }
     _open = false;
+    _micReady.store(false, std::memory_order_relaxed);
 }
 
 void Ps4CaptureSource::FreeTransfers()
@@ -861,6 +890,8 @@ void Ps4CaptureSource::OnIso(libusb_transfer* xfer)
 
 void Ps4CaptureSource::HandleIso(libusb_transfer* xfer)
 {
+    if (xfer->status == LIBUSB_TRANSFER_NO_DEVICE)
+        _deviceLost.store(true, std::memory_order_release);
     if (xfer->status == LIBUSB_TRANSFER_COMPLETED ||
         xfer->status == LIBUSB_TRANSFER_TIMED_OUT)
     {
@@ -904,8 +935,9 @@ void Ps4CaptureSource::HandleIso(libusb_transfer* xfer)
 // The device emits EOF every few packets — i.e. EOF delimits a SLICE, not a full
 // sensor image; one image spans many slices. So we strip the matching header off
 // every packet and accumulate the contiguous video bytes, cutting a frame when a
-// full image's worth has arrived (kFrameBytes). Geometry (stride / per-eye band
-// offsets) is the Phase-0 1280x800 layout, validated on hardware.
+// full image's worth has arrived (kFrameBytes). RAW mode always uses the
+// 1280x800 row layout above (stride / per-eye band offsets), validated on
+// hardware.
 void Ps4CaptureSource::OnPayload(const uint8_t* d, int len)
 {
     if (len <= 0)
@@ -1026,6 +1058,8 @@ void Ps4CaptureSource::ReassembleAndPublish(const uint8_t* frame)
     if (any)
     {
         ++_seq;
+        _latched = FrameSnapshot{ _geom, _seq, _generation };
+        _latchValid = true;
         _latchCv.notify_all();
     }
 }
@@ -1106,10 +1140,10 @@ bool Ps4CaptureSource::Ak5703BringUp()
     }
 
     // The write count IS a measured discriminator, not an assumption: this
-    // sequence lands 72/72 when it runs before the UVC commit, but only 36/72
-    // after the commit and 25/72 after the commit plus a PU control burst --
-    // the pipe wedges partway and the rest of the registers go nowhere. So a
-    // short count means the array is misconfigured and will be silent.
+    // sequence lands 72/72 before the streaming alt setting is selected, but
+    // only 34-36/72 after it and 25/72 after a PU control burst -- the pipe
+    // wedges partway and the rest of the registers go nowhere. So a short
+    // count means the array is misconfigured and will be silent.
     const bool good = (ok == kAk5703InitCount);
     _micReady.store(good, std::memory_order_relaxed);
     wchar_t msg[160];
@@ -1133,14 +1167,15 @@ uint8_t Ps4CaptureSource::MicGainReg() const
 // Registers 0x07 (mics 0+1) and 0x17 (mics 2+3) -- established by driving each
 // to 0xff in turn and watching which channels moved. 0x08 and
 // 0x18 hold the same value in the reference table but change nothing.
-void Ps4CaptureSource::WriteMicGain()
+bool Ps4CaptureSource::WriteMicGain()
 {
     if (!_h)
-        return;
+        return false;
     const uint8_t g = MicGainReg();
     const ps4::Ak5703Reg regs[2] = { { 0x0007, g }, { 0x0017, g } };
     for (int i = 0; i < 2; ++i)
-        RegWriteMulti(_h, &regs[i], 1, kAk5703Subaddr, kAk5703WriteMode);
+        if (RegWriteMulti(_h, &regs[i], 1, kAk5703Subaddr, kAk5703WriteMode) < 0) return false;
+    return true;
 }
 
 bool Ps4CaptureSource::SetMicGain(uint32_t pct)
@@ -1150,6 +1185,7 @@ bool Ps4CaptureSource::SetMicGain(uint32_t pct)
         pct = 100;
     if (pct == _micGainPct)
         return true;
+    const uint32_t previous = _micGainPct;
     _micGainPct = pct;
     if (!_open || !_useIsp || !_h)
         return true;                  // the next bring-up will pick it up
@@ -1163,12 +1199,16 @@ bool Ps4CaptureSource::SetMicGain(uint32_t pct)
     const bool wasStreaming = _streaming;
     if (wasStreaming)
         StopIso();
-    libusb_set_interface_alt_setting(_h, 1, 0);
-    WriteMicGain();
-    libusb_set_interface_alt_setting(_h, 1, 1);
-    if (!BringUpIsp())
-        return false;
-    return !wasStreaming || StartIso();
+    if (!Recommit(true, wasStreaming))
+    {
+        // The gain stays at its previous value and the next ApplySettings
+        // retries it. Only a stream that could not be restored is a failure
+        // the caller has to act on: the picture must not die over mic gain.
+        OutputDebugStringW(L"[PSCam4Win] PS4: microphone gain commit failed\n");
+        _micGainPct = previous;
+        return RecoverAfterFailedCommit(wasStreaming);
+    }
+    return true;
 }
 
 // Rebuild the mic DSP for the current geometry. Called whenever the stream
@@ -1244,13 +1284,13 @@ void Ps4CaptureSource::PublishAudio(const uint8_t* frame, uint32_t pts, bool pts
     // is heard as a click. Ramp down, hold silence for the real duration, and
     // ramp the next frame in.
     //
-    // The DEVICE's presentation timestamp decides, not the host clock. The old
-    // rule -- lost = (int)(elapsed*fps - 1.0 + 0.5) on QPC -- is honest at 60
+    // The DEVICE's presentation timestamp decides, not the host clock. The QPC
+    // rule below -- lost = (int)(elapsed*fps - 1.0 + 0.5) -- is honest at 60
     // and 120 fps but trips on ordinary iso jitter at 240, where one frame is
-    // 4.2 ms it conceals twice against a single real gap, inventing 200 samples
-    // of audio that was never missing. PTS cannot make
-    // that mistake, because a frame that merely arrived late still carries its
-    // own timestamp. QPC remains only as the fallback if PTS ever goes missing.
+    // 4.2 ms: it conceals twice against a single real gap, inventing 200
+    // samples of audio that was never missing. PTS cannot make that mistake,
+    // because a frame that merely arrived late still carries its own
+    // timestamp. QPC remains only as the fallback if PTS ever goes missing.
     uint32_t fadeIn = 0;
     int lost = 0;
     if (ptsValid && _micLastPtsValid)
@@ -1346,10 +1386,10 @@ void Ps4CaptureSource::PublishAudio(const uint8_t* frame, uint32_t pts, bool pts
             if (fadeIn && i < fadeIn)
                 v = (int32_t)((int64_t)v * i / fadeIn);   // ramp in after a gap
             _micRing[slot + c] = (int16_t)v;
-            // Accumulate at FULL precision. The old form squared (v >> 8),
-            // which is 0 for every sample under 256 LSB -- so a -50 dBFS room
-            // tone read a fixed ~-45 dBFS floor and -70 read the same. These
-            // meters are also the instrument the array is judged with.
+            // Accumulate at FULL precision: squaring a pre-shifted (v >> 8)
+            // zeroes every sample under 256 LSB, so a -50 dBFS room tone would
+            // read a fixed ~-45 dBFS floor and -70 the same. These meters are
+            // also the instrument the array is judged with.
             sumSq[c] += (int64_t)v * v;
         }
         ++_micWritePos;
@@ -1374,9 +1414,9 @@ void Ps4CaptureSource::PublishAudio(const uint8_t* frame, uint32_t pts, bool pts
         }
         // A SLIDING window, restarted whenever the measurement is invalidated.
         // A cumulative average since stream start cannot recover: one stall
-        // skews it permanently and it only crawls back asymptotically, which is
-        // exactly what was observed (a brief capture interruption took the
-        // estimate from +487 ppm to -572 and it was still wrong a minute later).
+        // skews it permanently and it only crawls back asymptotically (a brief
+        // capture interruption takes the estimate from +487 ppm to -572, still
+        // wrong a minute later).
         //
         // Two things invalidate it:
         //   * a CONCEALED GAP -- frames were missing, so the sample count no
@@ -1455,6 +1495,8 @@ void Ps4CaptureSource::PublishIspFrame(const uint8_t* frame, uint32_t pts, bool 
             memcpy(_pubRight.data() + (size_t)r * bandBytes, base + rightOff, bandBytes);
         }
         ++_seq;
+        _latched = FrameSnapshot{ _geom, _seq, _generation };
+        _latchValid = true;
         _latchCv.notify_all();
     }
 
@@ -1468,22 +1510,21 @@ uint64_t Ps4CaptureSource::WaitNewer(uint64_t lastSeq, uint32_t timeoutMs)
 {
     std::unique_lock<std::mutex> lk(_latchMutex);
     _latchCv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
-                      [&] { return _seq != lastSeq; });
-    return _seq;
+                      [&] { return _latchValid && _seq != lastSeq; });
+    return _latchValid ? _seq : lastSeq;
 }
 
-uint64_t Ps4CaptureSource::SnapshotPlanes(uint8_t* leftDst, uint8_t* rightDst)
+uint64_t Ps4CaptureSource::SnapshotPlanes(uint8_t* leftDst, uint8_t* rightDst, FrameSnapshot* metadata)
 {
-    // _eyeBytes, not _geom.EyeBytes(): this runs on a view's capture thread.
-    // See the _eyeBytes declaration for why an atomic rather than _stateMutex.
-    const uint32_t bytes = _eyeBytes.load(std::memory_order_acquire);
     std::lock_guard<std::mutex> lk(_latchMutex);
-    if (_seq == 0)
+    if (!_latchValid)
         return 0;
+    const uint32_t bytes = _useIsp ? _latched.geometry.EyeBytes() : kEyeBayerBytes;
     if (leftDst)
         memcpy(leftDst, _pubLeft.data(), bytes);
     if (rightDst)
         memcpy(rightDst, _pubRight.data(), bytes);
+    if (metadata) *metadata = _latched;
     return _seq;
 }
 

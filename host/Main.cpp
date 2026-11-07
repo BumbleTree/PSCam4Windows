@@ -14,9 +14,9 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <cstdio>
-#include <string>
 
 #include "CaptureController.h"
+#include "HostLog.h"
 #include "TrayUI.h"
 #include "SettingsDialog.h"
 #include "Autostart.h"
@@ -144,12 +144,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
 
     // ---- ordered shutdown: UI gone first, then the camera threads -------------
+    //
+    // The joins below wait as long as it takes: a capture thread cannot free its
+    // USB transfers while the driver still owns them. A driver that never
+    // completes a cancellation, or a Frame Server that never answers the virtual
+    // camera's Remove, would then hold the tray open forever. Bound the exit
+    // instead: once the process is ending nothing can touch the freed memory,
+    // and session-lifetime virtual cameras are removed with the process.
+    HANDLE exitDeadline = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        Sleep(30000);
+        HostLog(L"shutdown did not finish within 30 s -- terminating");
+        TerminateProcess(GetCurrentProcess(), 2);
+        return 0;
+    }, nullptr, 0, nullptr);
+
     settingsdialog::Close();
     tray.Destroy();
     for (int i = 0; i < kVCamCount; ++i)
     {
-        controllers[i].Stop();   // joins; tears down vcam -> camera -> shared memory
+        controllers[i].Stop();   // joins; tears down camera -> vcam -> shared memory
     }
+    if (exitDeadline)
+        CloseHandle(exitDeadline);   // the process exits before it can fire
     theme::Shutdown();
     CoUninitialize();
     if (mutex)

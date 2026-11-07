@@ -43,9 +43,6 @@ const Item* Items(size_t& count);
 // Raw view of an embedded resource (points into the mapped image; no copy).
 bool GetResourceBytes(WORD id, const BYTE*& data, DWORD& size);
 
-// BCrypt SHA-256 of a memory buffer.
-bool Sha256(const BYTE* data, size_t len, BYTE out[32]);
-
 // CREATE_ALWAYS write + flush + read-back + digest compare. Logs the failure
 // reason; on digest mismatch the bad file is deleted.
 bool WriteFileVerified(const std::wstring& absPath, const BYTE* data, DWORD size, Logger& log);

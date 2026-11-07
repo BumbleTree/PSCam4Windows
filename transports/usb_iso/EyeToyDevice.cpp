@@ -148,11 +148,6 @@ void StopSensor(libusb_device_handle* h)
     RegW(h, 0x51, 0x0f); RegW(h, 0x51, 0x00); RegW(h, 0x22, 0x00);
 }
 
-void FillYuy2Black(uint8_t* dst, uint32_t w, uint32_t h)
-{
-    yuv::FillBlack(dst, w, h);   // _yuy2Out is allocated at exactly w*h*2
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -191,25 +186,21 @@ bool EyeToyDevice::Init(const VideoMode& mode)
     BringUpOv519(_h, static_cast<int>(_width), static_cast<int>(_height), static_cast<int>(_fps));
     libusb_set_interface_alt_setting(_h, 0, 4);   // 896B alt; ample for QVGA + VGA
 
-    _yuy2Out.reset(new (std::nothrow) uint8_t[framebus::Yuy2Bytes(_width, _height)]);
-    if (!_yuy2Out)
-    {
-        libusb_release_interface(_h, 0);
-        libusb_close(_h);
-        _h = nullptr;
-        return false;
-    }
-    FillYuy2Black(_yuy2Out.get(), _width, _height);
-
-    _tjDecomp = tjInitDecompress();
-    if (!_tjDecomp)
-    {
+    auto releaseAndFail = [this] {
         _yuy2Out.reset();
         libusb_release_interface(_h, 0);
         libusb_close(_h);
         _h = nullptr;
         return false;
-    }
+    };
+    _yuy2Out.reset(new (std::nothrow) uint8_t[framebus::Yuy2Bytes(_width, _height)]);
+    if (!_yuy2Out)
+        return releaseAndFail();
+    yuv::FillBlack(_yuy2Out.get(), _width, _height);   // allocated at exactly w*h*2
+
+    _tjDecomp = tjInitDecompress();
+    if (!_tjDecomp)
+        return releaseAndFail();
     return true;
 }
 
@@ -261,7 +252,7 @@ bool EyeToyDevice::Start()
 
 void EyeToyDevice::Stop()
 {
-    if (_h && _streaming)
+    if (_h && !_xfers.empty())
     {
         // Cancel the ring and let the event thread drive every transfer to a
         // terminal (cancelled) callback before we free anything.
@@ -269,15 +260,11 @@ void EyeToyDevice::Stop()
         for (auto* t : _xfers)
             libusb_cancel_transfer(t);
 
-        // The callback stops resubmitting once _cancelling is set; wait until
-        // every transfer has reached its terminal callback. Bounded so a wedged
-        // transfer can't hang teardown forever.
-        for (int i = 0; i < 200; ++i)   // ~1s max
-        {
-            if (_xfersInFlight.load(std::memory_order_acquire) == 0)
-                break;
-            SleepMs(5);
-        }
+        // The callback stops resubmitting once _cancelling is set. Keep the
+        // device, callback target, buffers and event context alive until every
+        // transfer has reached its terminal callback: libusb owns a submitted
+        // transfer and its buffer until then.
+        while (_xfersInFlight.load(std::memory_order_acquire) != 0) SleepMs(5);
         _streaming = false;
     }
 
@@ -443,14 +430,28 @@ void EyeToyDevice::DecodeJpegToYuy2(const uint8_t* jpeg, uint32_t len)
     if (static_cast<uint32_t>(jw) != _width || static_cast<uint32_t>(jh) != _height)
         return;   // unexpected geometry; don't corrupt the output
 
+    // Only color layouts with integral, unpadded plane geometry are supported.
+    if (jcs != TJCS_YCbCr ||
+        (jss != TJSAMP_444 && jss != TJSAMP_422 && jss != TJSAMP_420 && jss != TJSAMP_440))
+        return;
+    const int cw = tjPlaneWidth(1, jw, jss);
+    const int ch = tjPlaneHeight(1, jh, jss);
+    if (cw <= 0 || ch <= 0 || jw % cw || jh % ch ||
+        tjPlaneWidth(0, jw, jss) != jw || tjPlaneHeight(0, jh, jss) != jh)
+        return;
     const unsigned long need = tjBufSizeYUV2(jw, 1, jh, jss);
+    const size_t planeBytes = static_cast<size_t>(jw) * jh + 2 * static_cast<size_t>(cw) * ch;
+    if (!need || need == static_cast<unsigned long>(-1) || need < planeBytes ||
+        need > static_cast<size_t>(jw) * jh * 3)
+        return;
     if (_yuvScratch.size() < need)
-        _yuvScratch.resize(need);
+    {
+        try { _yuvScratch.resize(need); }
+        catch (const std::bad_alloc&) { return; }
+    }
     if (tjDecompressToYUV2(_tjDecomp, jpeg, len, _yuvScratch.data(), jw, 1, jh, 0) != 0)
         return;
 
-    const int cw = tjPlaneWidth(1, jw, jss);   // chroma plane width
-    const int ch = tjPlaneHeight(1, jh, jss);  // chroma plane height
     const int hs = jw / cw;                     // horizontal chroma sub-factor (1 or 2)
     const int vs = jh / ch;                     // vertical chroma sub-factor (1 or 2)
 
@@ -504,9 +505,8 @@ void EyeToyDevice::DecodeJpegToYuy2(const uint8_t* jpeg, uint32_t len)
 
 void EyeToyDevice::ApplySettings(const Settings& s)
 {
-    // Flip is done in software during decode (the OV7648 has no hardware flip
-    // register in the proven driver path), so latch it even if the sensor isn't
-    // open yet — it takes effect on the next decoded frame.
+    // Flip is done in software during decode, so latch it even if the sensor
+    // isn't open yet — it takes effect on the next decoded frame.
     _flipH = s.flipH;
     _flipV = s.flipV;
 

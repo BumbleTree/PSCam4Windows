@@ -17,9 +17,8 @@
 // The IMFVirtualCamera registration is dynamic: it exists only while a physical
 // camera occupies this slot, and is advertised under that device's own name, so
 // apps see exactly the cameras that are plugged in. Arrival/removal is signaled
-// by the tray window's
-// device-interface notification through NotifyDeviceChange(), with a slow
-// fallback poll while the slot is empty.
+// by the tray window's device-interface notification through
+// NotifyDeviceChange(), with a slow fallback poll while the slot is empty.
 //
 // The UI thread NEVER touches the camera: it calls UpdateSettings() with a
 // full snapshot; this thread drains it at safe points. Mode changes apply
@@ -31,6 +30,7 @@
 #include <atomic>
 #include <string>
 #include "../common/Settings.h"
+#include "RecordingCommands.h"
 
 class CaptureController
 {
@@ -41,7 +41,7 @@ public:
         Asleep,         // virtual camera registered, physical camera off
         Waking,
         Streaming,
-        CameraMissing,  // PS3 Eye not found / unplugged (retrying)
+        CameraMissing,  // slot empty / camera unplugged, or its USB setup failed (retrying)
         VCamFailed,     // MFCreateVirtualCamera/Start failing (retrying)
         Ps4NeedsReplug, // PS4 present but its firmware session is wedged (replug)
         Fatal,          // unrecoverable (e.g. shared memory creation failed)
@@ -56,7 +56,8 @@ public:
     void UpdateSettings(const Settings& s);
 
     // Pokes the camera thread to re-evaluate slot occupancy (called by the
-    // tray window on WM_DEVICECHANGE for the PS3 Eye interface class).
+    // tray window on WM_DEVICECHANGE for any camera interface class, and when a
+    // setting changes the slot map).
     void NotifyDeviceChange();
 
     State    GetState() const { return _state.load(std::memory_order_relaxed); }
@@ -66,9 +67,9 @@ public:
 
     // ---- microphone (PS4 only; see ICameraDevice::AudioChannels) ----------
     // The camera thread owns the device, so the UI cannot call it directly.
-    // Levels are published into atomics once per captured frame, and recording
-    // is a flag the thread observes — no locks on the UI side.
-    static const uint32_t kMicMaxChannels = 4;
+    // Levels are published into atomics. Recording requests carry an immutable
+    // path and generation; the capture thread acknowledges their result.
+    static constexpr uint32_t kMicMaxChannels = 4;
 
     // 0 when the selected camera has no in-band microphone.
     uint32_t MicChannels() const { return _micChannels.load(std::memory_order_relaxed); }
@@ -77,12 +78,15 @@ public:
     bool     MicRecording() const { return _micRecording.load(std::memory_order_relaxed); }
     uint32_t MicRecordedSeconds() const { return _micRecSecs.load(std::memory_order_relaxed); }
     uint32_t MicDropouts() const { return _micDropouts.load(std::memory_order_relaxed); }
-    // Begin writing a 4-channel WAV; returns the chosen path (empty on failure).
-    // Path of the most recent recording, empty until one is started. Written by
-    // MicStartRecording and read by the dialog, both on the UI thread.
-    const std::wstring& MicRecordingPath() const { return _micRecPath; }
+    // Path of the most recent recording request, copied under its lock.
+    std::wstring MicRecordingPath() const { return _recording.Snapshot().path; }
+    bool MicRecordingRequested() const { return _recording.Snapshot().start; }
+    RecordingCommands::State MicRecordingState() const { return _recording.Status(); }
+    // Request a WAV recording of every channel into the Videos folder; returns
+    // the chosen path (empty when there is no microphone or no path could be
+    // made). The capture thread opens the file and acknowledges the result.
     std::wstring MicStartRecording();
-    void         MicStopRecording() { _micRecording.store(false, std::memory_order_release); }
+    void         MicStopRecording() { _recording.Stop(); }
 
     Settings ActiveSettings() const;
 
@@ -148,6 +152,5 @@ private:
     std::atomic<bool>     _micRecording{ false };
     std::atomic<uint32_t> _micRecSecs{ 0 };
     std::atomic<uint32_t> _micDropouts{ 0 };
-    std::wstring          _micRecPath;                       // set before the flag
-
+    RecordingCommands    _recording;
 };

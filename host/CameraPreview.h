@@ -2,14 +2,15 @@
 //
 // CameraPreview — a self-contained live-preview widget for the Settings dialog.
 //
-// Owns a child static window (created from the IDC_PREVIEW control in the
-// dialog template and subclassed so we can paint it ourselves), a dedicated
-// worker thread that blocks on the camera's FrameReady auto-reset event, and a
-// DIB section the worker writes converted BGRA into while WM_PAINT blits from.
+// Owns a child static window (the settings window's IDC_PREVIEW control,
+// subclassed so we can paint it ourselves), a dedicated worker thread that polls
+// the camera's FrameBus (never its FrameReady event — see
+// FrameBusPreviewSource.h), and a DIB section the worker writes converted BGRA
+// into while WM_PAINT blits from it.
 //
 // Threading model:
-//   * Public methods (Attach/Detach/SetCamera/SetControllerArray) are called
-//     on the dialog (UI) thread only.
+//   * Public methods (Attach/Detach/SetCamera/SetCell/SetControllerArray) are
+//     called on the dialog (UI) thread only.
 //   * The worker thread owns _source and writes converted BGRA into the DIB
 //     under an exclusive SRWLOCK (held only for the ~1ms write). WM_PAINT
 //     reads the DIB under a shared SRWLOCK (held only for the StretchBlt) so
@@ -38,8 +39,8 @@ public:
     CameraPreview();
     ~CameraPreview();
 
-    // Take ownership of the IDC_PREVIEW control in the dialog. Subclasses it,
-    // fits it to the source aspect ratio, and starts the worker thread.
+    // Take ownership of the `ctrlId` child of `parent`. Subclasses it, fits it
+    // to the source aspect ratio, and starts the worker thread. `inst` is unused.
     void Attach(HWND parent, int ctrlId, HINSTANCE inst);
     // Signals the worker, joins it, removes the subclass, tears down the DIB,
     // and clears the preview-hold flag. Idempotent.
@@ -85,10 +86,10 @@ private:
     HWND   _wnd          = nullptr;
     CaptureController* _controllers = nullptr;
 
-    // Original layout cell (dialog-template units -> client pixels), captured
-    // once in Attach. ResizeToAspect fits the control to the source aspect
-    // ratio inside this cell, so the control never outgrows its allotted space
-    // and never accumulates drift across repeated resizes.
+    // Layout cell in parent client pixels: seeded from the control's rect in
+    // Attach, then owned by the layout through SetCell. ResizeToAspect fits the
+    // control to the source aspect ratio inside this cell, so the control never
+    // outgrows its allotted space and never accumulates drift across resizes.
     RECT   _cell{ 0, 0, 0, 0 };
 
     // DIB section: worker converts into the bits under an exclusive SRWLOCK,

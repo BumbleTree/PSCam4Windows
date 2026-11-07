@@ -20,6 +20,7 @@ const Item kItems[] = {
     { IDR_PAYLOAD_DLL,   kDllName,                             Component::Core },
     { IDR_PAYLOAD_TRAY,  kTrayExeName,                         Component::Core },
     { IDR_LICENSE,       L"LICENSE.txt",                       Component::Core },
+    { IDR_THIRD_PARTY,   L"THIRD_PARTY_NOTICES.txt",            Component::Core },
     { IDR_INF_PS3,       L"driver\\usb_device.inf",            Component::Ps3Driver },
     { IDR_CAT_PS3,       L"driver\\usb_device.cat",            Component::Ps3Driver },
     { IDR_CER_PS3,       L"driver\\usb_device.cer",            Component::Ps3Driver },
@@ -54,6 +55,10 @@ bool GetResourceBytes(WORD id, const BYTE*& data, DWORD& size)
     return data != nullptr && size > 0;
 }
 
+namespace
+{
+
+// BCrypt SHA-256 of a memory buffer.
 bool Sha256(const BYTE* data, size_t len, BYTE out[32])
 {
     BCRYPT_ALG_HANDLE alg = nullptr;
@@ -72,6 +77,8 @@ bool Sha256(const BYTE* data, size_t len, BYTE out[32])
     BCryptCloseAlgorithmProvider(alg, 0);
     return ok;
 }
+
+} // namespace
 
 bool WriteFileVerified(const std::wstring& absPath, const BYTE* data, DWORD size, Logger& log)
 {

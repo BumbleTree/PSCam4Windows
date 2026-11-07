@@ -98,10 +98,10 @@ struct Settings
     // FNV-1a hash of the USB port path of the camera that ps4Split was set for.
     // ps4Split is honored only when this matches the camera currently in the slot,
     // so a DIFFERENT camera reusing this slot index can't inherit a stale split and
-    // silently claim a second slot. 0 is the legacy wildcard (a split saved before
-    // owner tagging, or with the camera briefly absent): honored for ANY camera so
-    // pre-upgrade setups keep working; it is stamped with a real owner on the next
-    // Split toggle. See deviceregistry::Ps4OwnerHash.
+    // silently claim a second slot. 0 is a wildcard (a split stored without an
+    // owner tag, or saved while the camera was briefly absent): honored for ANY
+    // camera so such a split is not silently undone; the next Split toggle stamps
+    // a real owner. See deviceregistry::Ps4OwnerHash.
     uint32_t ps4SplitOwner = 0;
 
     bool SameMode(const Settings& o) const
@@ -121,7 +121,7 @@ struct Settings
 // They live next to the struct on purpose, because a control added to Settings
 // without editing both is dropped SILENTLY — the slider moves, the value
 // persists, and the camera never sees it. Add a control here, once, and both
-// paths pick it up. unit.settings.sensorcontrols fails if one is missed.
+// paths pick it up.
 // ---------------------------------------------------------------------------
 inline bool SensorControlsEqual(const Settings& a, const Settings& b)
 {
@@ -156,9 +156,9 @@ namespace settings
     // ---- global audio-render target (NOT per-camera) ----------------------
     // The MMDevice id of the output the PS4 microphone is rendered into, or
     // empty for off. Deliberately outside `Settings`: there is one renderer,
-    // not one per camera slot, and Settings is an all-DWORD struct whose three
-    // parallel field lists (struct / Load / Save) are guarded by a sizeof
-    // tripwire -- adding a std::wstring there would trip it for no benefit.
+    // not one per camera slot, and every Settings field is persisted as one
+    // REG_DWORD through parallel field lists (struct / Load / Save) -- a string
+    // does not fit that shape.
     //
     // The ID is persisted rather than the friendly name because names are not
     // unique and change with driver revisions, while the id is stable.
@@ -168,8 +168,8 @@ namespace settings
     // Whether routing may keep the camera STREAMING with no video client, which
     // is the only way in-band audio can exist while nothing is watching. Global
     // for the same two reasons as the device id: there is one renderer, and the
-    // controller's Asleep pass watches this key (not its Camera%d subkeys), so a
-    // per-camera value could never wake a sleeping slot.
+    // controller's Asleep pass watches only the root key (not the Camera%d
+    // subkeys), so a per-camera value could not wake every sleeping slot.
     //
     // Defaults to TRUE -- a microphone that dies whenever no app has the camera
     // open is not a microphone. It only has effect while an output is selected;
@@ -178,10 +178,9 @@ namespace settings
     void SaveMicKeepAwake(bool on);
 
     // ---- global UI theme -------------------------------------------------
-    // One window, so one value; it
-    // lives beside the render target rather than in `Settings` for the same
-    // reason -- that struct is per-camera and guarded by a sizeof tripwire.
-    // 0 = follow Windows (the default), 1 = dark, 2 = light.
+    // One window, so one value; it lives beside the render target rather than
+    // in the per-camera `Settings`. 0 = follow Windows (the default), 1 = dark,
+    // 2 = light.
     uint32_t LoadUiTheme();
     void     SaveUiTheme(uint32_t mode);
 
@@ -189,5 +188,4 @@ namespace settings
     Settings Load(int cameraIndex = 0);                    // missing values -> struct defaults
     bool     Save(int cameraIndex, const Settings& s);   // full write
     void     SeedDefaults(int cameraIndex = 0);            // write only values not yet present
-    int      FindModeIndex(uint32_t w, uint32_t h, uint32_t fps);  // -1 if unknown
 }

@@ -1,13 +1,12 @@
 #pragma once
 //
-// ICameraPreviewSource — the future-proofing seam between the Settings dialog
-// preview UI and whatever transport a given camera driver uses to publish
-// frames to the tray.
+// ICameraPreviewSource — the seam between the Settings dialog preview UI and
+// whatever transport a camera's frames are published over.
 //
 // The preview window speaks only to this interface. The implementation is
 // FrameBusPreviewSource, which wraps the FrameBus seqlock shared memory + the
 // read-only ControlBus activity query. It is transport-agnostic — every device
-// (PS3 Eye, EyeToy, ...) publishes to the same FrameBus, so no per-device
+// (PS3 Eye, EyeToy, PS4) publishes to the same FrameBus, so no per-device
 // preview implementation is needed; the preview UI and worker thread are fixed.
 //
 // Implementations must be safe to call from a single dedicated worker thread

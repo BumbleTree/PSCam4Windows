@@ -26,6 +26,14 @@
 
 namespace deviceregistry {
 
+inline VideoMode ReframePs4Mode(VideoMode mode, Ps4ViewKind from, Ps4ViewKind to)
+{
+    const bool fromSbs = from == Ps4ViewKind::SideBySide;
+    const bool toSbs = to == Ps4ViewKind::SideBySide;
+    if (fromSbs != toSbs) mode.width = toSbs ? mode.width * 2 : mode.width / 2;
+    return mode;
+}
+
 // One slot's PS4 occupancy. `split`/`view` are meaningful only while `portPath`
 // is set; a switchable slot leaves `view` at its default (resolved from Settings).
 struct Ps4SlotRec

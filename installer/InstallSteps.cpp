@@ -1,6 +1,9 @@
 #include "InstallSteps.h"
 
 #include <bcrypt.h>
+#include <objbase.h>
+#include <algorithm>
+#include "../common/VCamGuids.h"
 
 #include "Payload.h"
 #include "SetupLog.h"
@@ -57,9 +60,69 @@ void MakeParents(const std::wstring& filePath)
     }
 }
 
-// True when `path` exists and its whole-file SHA-1 equals `sha1` (lowercase
-// hex). Used to decide whether a cached blob is the supported build.
-bool FileMatchesSha1(const std::wstring& path, const char* sha1);
+// The run's private backup directory, created on first use and deleted after
+// a clean finish.
+bool EnsureBackupDir(SetupContext& ctx)
+{
+    if (!ctx.backupDir.empty())
+        return true;
+    wchar_t temp[MAX_PATH]{}, id[64]{};
+    GUID guid{};
+    if (!GetTempPathW(_countof(temp), temp) || FAILED(CoCreateGuid(&guid)) ||
+        !StringFromGUID2(guid, id, _countof(id)))
+        return false;
+    const std::wstring dir = ops::JoinPath(temp, (std::wstring(L"PSCam4Win-backup-") + id).c_str());
+    if (!CreateDirectoryW(dir.c_str(), nullptr))
+        return false;
+    ctx.backupDir = dir;
+    return true;
+}
+
+bool BackupFile(SetupContext& ctx, const std::wstring& target, const wchar_t* relTarget,
+                std::vector<std::pair<std::wstring, std::wstring>>& backups)
+{
+    if (!ops::PathExists(target))
+        return true;
+    if (!EnsureBackupDir(ctx))
+        return false;
+    const std::wstring backup = ops::JoinPath(ctx.backupDir, relTarget);
+    MakeParents(backup);
+    backups.emplace_back(target, backup);
+    if (!MoveFileExW(target.c_str(), backup.c_str(), MOVEFILE_COPY_ALLOWED))
+    {
+        backups.pop_back();
+        ctx.log->Line(L"error: cannot back up %s (code %lu)", target.c_str(), GetLastError());
+        return false;
+    }
+    return true;
+}
+
+void RestoreFiles(SetupContext& ctx, const std::vector<std::wstring>& written,
+                  const std::vector<std::pair<std::wstring, std::wstring>>& backups)
+{
+    for (auto it = written.rbegin(); it != written.rend(); ++it)
+    {
+        if (!ops::PathExists(*it))
+            continue;
+        SetFileAttributesW(it->c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (!DeleteFileW(it->c_str()))
+        {
+            ctx.rollbackIncomplete = true;
+            ctx.log->Line(L"recovery: cannot remove %s (code %lu)", it->c_str(), GetLastError());
+        }
+    }
+    for (auto it = backups.rbegin(); it != backups.rend(); ++it)
+    {
+        MakeParents(it->first);
+        if (!MoveFileExW(it->second.c_str(), it->first.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+        {
+            ctx.rollbackIncomplete = true;
+            ctx.log->Line(L"recovery: cannot restore %s (code %lu); backup retained at %s",
+                          it->first.c_str(), GetLastError(), it->second.c_str());
+        }
+    }
+}
 
 // Lowercase-hex BCrypt SHA-1 ("" on failure). The firmware pipeline pins
 // SHA-1 end-to-end: the same digest is re-checked by the app before any USB
@@ -92,6 +155,8 @@ std::string Sha1Hex(const BYTE* data, size_t len)
     return hex;
 }
 
+// True when `path` exists and its whole-file SHA-1 equals `sha1` (lowercase
+// hex). Used to decide whether a cached blob is the supported build.
 bool FileMatchesSha1(const std::wstring& path, const char* sha1)
 {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -114,12 +179,9 @@ bool FileMatchesSha1(const std::wstring& path, const char* sha1)
 } // namespace
 
 const DriverDef kDrivers[3] = {
-    { L"PS3 Eye",    L"usb_device.inf",    L"usb_device.cer",    L"PnpOem_usb_device",
-      IDR_INF_PS3,    IDR_CAT_PS3,    IDR_CER_PS3 },
-    { L"PS2 EyeToy", L"eyetoy_device.inf", L"eyetoy_device.cer", L"PnpOem_eyetoy_device",
-      IDR_INF_EYETOY, IDR_CAT_EYETOY, IDR_CER_EYETOY },
-    { L"PS4 Camera", L"ps4cam_device.inf", L"ps4cam_device.cer", L"PnpOem_ps4cam_device",
-      IDR_INF_PS4,    IDR_CAT_PS4,    IDR_CER_PS4 },
+    { L"PS3 Eye",    L"usb_device.inf",    L"PnpOem_usb_device",    IDR_CER_PS3 },
+    { L"PS2 EyeToy", L"eyetoy_device.inf", L"PnpOem_eyetoy_device", IDR_CER_EYETOY },
+    { L"PS4 Camera", L"ps4cam_device.inf", L"PnpOem_ps4cam_device", IDR_CER_PS4 },
 };
 
 // kDrivers and kCameraInterfaceGuids are indexed together, PS3 / EyeToy / PS4.
@@ -139,6 +201,15 @@ bool DriverSelected(const InstallOptions& opts, int index)
 
 namespace
 {
+
+// Thumbprint of the certificate embedded for driver package `index`.
+bool PayloadCertThumbprint(int index, BYTE out[20])
+{
+    const BYTE* der = nullptr;
+    DWORD len = 0;
+    return payload::GetResourceBytes(kDrivers[index].cerRes, der, len) &&
+           ops::ThumbprintOfCertBytes(der, len, out);
+}
 
 // ---------------------------------------------------------------- install steps
 
@@ -164,7 +235,7 @@ public:
 
     void Undo(SetupContext& ctx) noexcept override
     {
-        if (!ctx.prevTrayPath.empty() && ops::PathExists(ctx.prevTrayPath))
+        if (!ctx.rollbackIncomplete && !ctx.prevTrayPath.empty() && ops::PathExists(ctx.prevTrayPath))
             ops::LaunchDetached(ctx.prevTrayPath, L"");
     }
 };
@@ -177,8 +248,8 @@ public:
 
     bool Run(SetupContext& ctx) override
     {
-        // Non-fatal like the old installer: a service that refuses to stop
-        // surfaces later as a locked-file error with a clearer message.
+        // Non-fatal: a service that refuses to stop surfaces later as a
+        // locked-file error with a clearer message.
         for (int i = 0; i < 2; ++i)
             ops::StopServiceByName(kServices[i], ctx.serviceWasRunning[i], 15000, *ctx.log);
         return true;
@@ -206,8 +277,8 @@ public:
 
     bool Run(SetupContext& ctx) override
     {
-        // Removing the deprecated product is one-way by design; every action
-        // is best-effort and logged, exactly like the old install.bat.
+        // Removing the legacy product is one-way by design (no Undo); every
+        // action is best-effort and logged.
         if (ops::ScheduledTaskExists(kLegacyTaskName))
         {
             ctx.log->Line(L"removing the old logon task");
@@ -313,18 +384,18 @@ public:
             }
 
             const std::wstring target = ops::JoinPath(ctx.installDir, item.relTarget);
-            if (!BackupExisting(ctx, target, item.relTarget))
-                return false;
-            if (!payload::WriteFileVerified(target, data, size, *ctx.log))
+            if (!BackupFile(ctx, target, item.relTarget, ctx.backups))
                 return false;
             ctx.filesWritten.push_back(target);
+            if (!payload::WriteFileVerified(target, data, size, *ctx.log))
+                return false;
             ctx.log->Line(L"installed %s", item.relTarget);
         }
 
         // A bat-era install left uninstall.bat behind; quarantine it so a
         // successful install removes it and a rollback puts it back.
         const std::wstring staleBat = ops::JoinPath(ctx.installDir, L"uninstall.bat");
-        if (ops::PathExists(staleBat) && !BackupExisting(ctx, staleBat, L"uninstall.bat"))
+        if (ops::PathExists(staleBat) && !BackupFile(ctx, staleBat, L"uninstall.bat", ctx.backups))
             return false;
 
         // The setup exe doubles as the uninstaller.
@@ -332,8 +403,9 @@ public:
             ops::JoinPath(ctx.installDir, L"PSCam4Win-Setup.exe");
         if (_wcsicmp(setupTarget.c_str(), ctx.setupExePath.c_str()) != 0)
         {
-            if (!BackupExisting(ctx, setupTarget, L"PSCam4Win-Setup.exe"))
+            if (!BackupFile(ctx, setupTarget, L"PSCam4Win-Setup.exe", ctx.backups))
                 return false;
+            ctx.filesWritten.push_back(setupTarget);
             if (!CopyFileW(ctx.setupExePath.c_str(), setupTarget.c_str(), FALSE))
             {
                 ctx.log->Line(L"error: cannot copy the setup program into place (code %lu)",
@@ -342,7 +414,6 @@ public:
             }
             // The installed uninstaller must never carry mark-of-the-web.
             DeleteFileW((setupTarget + L":Zone.Identifier").c_str());
-            ctx.filesWritten.push_back(setupTarget);
             ctx.log->Line(L"installed PSCam4Win-Setup.exe (uninstaller)");
         }
         return true;
@@ -350,17 +421,7 @@ public:
 
     void Undo(SetupContext& ctx) noexcept override
     {
-        for (auto it = ctx.filesWritten.rbegin(); it != ctx.filesWritten.rend(); ++it)
-        {
-            SetFileAttributesW(it->c_str(), FILE_ATTRIBUTE_NORMAL);
-            DeleteFileW(it->c_str());
-        }
-        for (auto it = ctx.backups.rbegin(); it != ctx.backups.rend(); ++it)
-        {
-            MakeParents(it->first);
-            MoveFileExW(it->second.c_str(), it->first.c_str(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
-        }
+        RestoreFiles(ctx, ctx.filesWritten, ctx.backups);
     }
 
 private:
@@ -374,33 +435,6 @@ private:
         case Component::Ps4Driver:    return opts.compPs4;
         default:                      return false;
         }
-    }
-
-    static bool BackupExisting(SetupContext& ctx, const std::wstring& target,
-                               const wchar_t* relTarget)
-    {
-        if (!ops::PathExists(target))
-            return true;
-        if (ctx.backupDir.empty())
-        {
-            wchar_t tempDir[MAX_PATH] = {};
-            GetTempPathW(_countof(tempDir), tempDir);
-            wchar_t leaf[64];
-            swprintf_s(leaf, L"PSCam4Win-backup-%lu", GetCurrentProcessId());
-            ctx.backupDir = ops::JoinPath(tempDir, leaf);
-        }
-        const std::wstring backupPath = ops::JoinPath(ctx.backupDir, relTarget);
-        MakeParents(backupPath);
-        if (!MoveFileExW(target.c_str(), backupPath.c_str(),
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
-        {
-            ctx.log->Line(L"error: cannot move the existing %s aside (code %lu). "
-                          L"Close every app that is using the camera and retry.",
-                          relTarget, GetLastError());
-            return false;
-        }
-        ctx.backups.emplace_back(target, backupPath);
-        return true;
     }
 };
 
@@ -422,24 +456,48 @@ public:
 
     bool Run(SetupContext& ctx) override
     {
+        for (int i = 0; i < kVCamCount; ++i)
+        {
+            _paths[i] = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + kVCamClsidStrings[i];
+            const LSTATUS status = ops::SnapshotRegistryTree(HKEY_LOCAL_MACHINE,
+                                                             _paths[i].c_str(), _previous[i]);
+            if (status != ERROR_SUCCESS)
+            {
+                ctx.log->Line(L"error: cannot snapshot COM registration (code %ld)", status);
+                return false;
+            }
+        }
+        _attempted = true;
         const std::wstring dll = ops::JoinPath(ctx.installDir, payload::kDllName);
         const HRESULT hr = ops::RegisterComDll(dll, false, *ctx.log);
         if (FAILED(hr))
-        {
-            ctx.log->Line(L"error: virtual camera registration failed (hr=0x%08X). "
-                          L"Make sure Windows Media Foundation is intact.", hr);
-            return false;
-        }
-        return true;
+            ctx.log->Line(L"error: virtual camera registration failed (hr=0x%08X)", hr);
+        return SUCCEEDED(hr);
     }
 
     void Undo(SetupContext& ctx) noexcept override
     {
-        UnregisterVCam(ctx);
+        if (!_attempted)
+            return;
+        for (int i = 0; i < kVCamCount; ++i)
+        {
+            const LSTATUS status = ops::RestoreRegistryTree(HKEY_LOCAL_MACHINE,
+                                                            _paths[i].c_str(), _previous[i]);
+            if (status != ERROR_SUCCESS)
+            {
+                ctx.rollbackIncomplete = true;
+                ctx.log->Line(L"recovery: cannot restore COM registration %s (code %ld)",
+                              _paths[i].c_str(), status);
+            }
+        }
     }
+private:
+    bool _attempted = false;
+    std::wstring _paths[kVCamCount];
+    ops::RegistryTree _previous[kVCamCount];
 };
 
-// Kept next to its counterpart above; used by the uninstall list.
+// Uninstall counterpart of RegisterComStep.
 class UnregisterComStep : public Step
 {
 public:
@@ -486,10 +544,9 @@ public:
                     continue;   // the three .cer files can share one certificate
             }
             ctx.log->Line(L"installing the %s driver certificate", kDrivers[i].displayName);
-            CertRecord rec;
-            if (!ops::AddCertToSystemStores(der, len, rec, *ctx.log))
+            ctx.certsAdded.emplace_back();
+            if (!ops::AddCertToSystemStores(der, len, ctx.certsAdded.back(), *ctx.log))
                 return false;
-            ctx.certsAdded.push_back(rec);
         }
         return true;
     }
@@ -498,20 +555,121 @@ public:
     {
         for (auto it = ctx.certsAdded.rbegin(); it != ctx.certsAdded.rend(); ++it)
             if (it->addedToRoot || it->addedToTrustedPub)
-                ops::RemoveCertByThumbprint(it->thumbprint, it->addedToRoot,
-                                            it->addedToTrustedPub, *ctx.log);
+                if (!ops::RemoveCertByThumbprint(it->thumbprint, it->addedToRoot,
+                                                 it->addedToTrustedPub, *ctx.log))
+                    ctx.rollbackIncomplete = true;
     }
+};
+
+// Two PS3 Eye packages from early releases break the camera's microphone and
+// stay in the driver store, outranking the inbox drivers on every replug:
+//
+//  * the first release bound WinUSB to the WHOLE device (DeviceID
+//    "VID_1415&PID_2000", no &MI_). usbccgp never loads, so the audio function
+//    never appears and Windows lists no microphone while video keeps working;
+//  * a later one bound a custom audio INF to MI_01, which delivered silence.
+//
+// Only packages proven ours are removed: the WinUSB one by leaf name + our
+// interface GUID + that exact whole-device ID (Zadig/libwdi packages carry
+// other GUIDs), the audio one by leaf name + our old provider name. Each is
+// exported first so a rollback can put it back.
+class RetireOldPs3DriversStep : public Step
+{
+public:
+    const wchar_t* Name() const override { return L"Removing old PS3 Eye drivers from earlier releases"; }
+    bool Applies(const SetupContext& ctx) const override { return ctx.opts.compPs3; }
+
+    bool Run(SetupContext& ctx) override
+    {
+        wchar_t winDir[MAX_PATH]{};
+        if (!GetWindowsDirectoryW(winDir, _countof(winDir)))
+            return true;
+        std::vector<std::pair<std::wstring, std::wstring>> stale;   // oem name, original leaf
+        std::vector<std::wstring> names;
+        if (ops::EnumeratePublishedInfNames(kDrivers[0].infLeaf, kCameraInterfaceGuids[0], names))
+        {
+            for (const auto& name : names)
+                if (ops::InfDeviceIdIs(std::wstring(winDir) + L"\\INF\\" + name, L"VID_1415&PID_2000"))
+                {
+                    ctx.log->Line(L"%s binds WinUSB to the whole PS3 Eye, which hides its microphone",
+                                  name.c_str());
+                    stale.emplace_back(name, kDrivers[0].infLeaf);
+                }
+        }
+        else
+            ctx.log->Line(L"warning: cannot inventory the driver store for an old PS3 Eye driver");
+        if (ops::EnumerateLegacyPs3AudioInfNames(names))
+        {
+            for (const auto& name : names)
+            {
+                ctx.log->Line(L"%s is the old PS3 Eye audio driver, which silences its microphone",
+                              name.c_str());
+                stale.emplace_back(name, L"usb_audio.inf");
+            }
+        }
+        else
+            ctx.log->Line(L"warning: cannot inventory the driver store for an old PS3 Eye audio driver");
+
+        for (const auto& [name, leaf] : stale)
+        {
+            std::wstring exportDir;
+            if (EnsureBackupDir(ctx))
+            {
+                exportDir = ops::JoinPath(ctx.backupDir,
+                    (std::wstring(L"drivers\\") + name).c_str());
+                MakeParents(ops::JoinPath(exportDir, L"x"));
+            }
+            std::wstring output;
+            if (exportDir.empty() ||
+                ops::RunPnputil(L"/export-driver " + name + L" \"" + exportDir + L"\"",
+                                output, *ctx.log, ctx.cancel) != ERROR_SUCCESS)
+            {
+                // Without a copy a rollback could not restore it, so leave it;
+                // the tray reports the hidden microphone and how to fix it.
+                ctx.log->Line(L"warning: cannot back up %s -- leaving it installed", name.c_str());
+                continue;
+            }
+            const DWORD code = ops::RunPnputil(L"/delete-driver " + name + L" /uninstall /force",
+                                               output, *ctx.log, ctx.cancel);
+            if (code == ERROR_SUCCESS || code == ERROR_SUCCESS_REBOOT_REQUIRED)
+            {
+                ctx.rebootRequired |= code == ERROR_SUCCESS_REBOOT_REQUIRED;
+                _retired.push_back(ops::JoinPath(exportDir, leaf.c_str()));
+                ctx.log->Line(L"removed %s; replug the PS3 Eye to load its microphone", name.c_str());
+            }
+            else
+                ctx.log->Line(L"warning: cannot remove %s (code %lu)", name.c_str(), code);
+        }
+        return true;
+    }
+
+    void Undo(SetupContext& ctx) noexcept override
+    {
+        for (auto it = _retired.rbegin(); it != _retired.rend(); ++it)
+        {
+            std::wstring output;
+            const DWORD code = ops::RunPnputil(L"/add-driver \"" + *it + L"\" /install",
+                                               output, *ctx.log);
+            if (code != ERROR_SUCCESS && code != ERROR_NO_MORE_ITEMS &&
+                code != ERROR_SUCCESS_REBOOT_REQUIRED)
+            {
+                ctx.rollbackIncomplete = true;
+                ctx.log->Line(L"recovery: cannot restore the old PS3 Eye driver %s (code %lu)",
+                              it->c_str(), code);
+            }
+        }
+    }
+
+private:
+    std::vector<std::wstring> _retired;   // exported INF paths, in removal order
 };
 
 class InstallDriversStep : public Step
 {
 public:
     const wchar_t* Name() const override { return L"Installing the WinUSB camera drivers"; }
-
     bool Applies(const SetupContext& ctx) const override
-    {
-        return ctx.opts.compPs3 || ctx.opts.compEyeToy || ctx.opts.compPs4;
-    }
+    { return ctx.opts.compPs3 || ctx.opts.compEyeToy || ctx.opts.compPs4; }
 
     bool Run(SetupContext& ctx) override
     {
@@ -519,67 +677,55 @@ public:
         {
             if (!DriverSelected(ctx.opts, i))
                 continue;
-
-            // What is published for this camera before we touch anything. Only
-            // meaningful once compared with what pnputil publishes below.
-            std::wstring existingOem;
-            ops::FindPublishedInfName(kDrivers[i].infLeaf, kCameraInterfaceGuids[i],
-                                      existingOem);
-
-            const std::wstring inf = ops::JoinPath(
-                ctx.installDir, (std::wstring(L"driver\\") + kDrivers[i].infLeaf).c_str());
-            ctx.log->Line(L"installing the %s driver...", kDrivers[i].displayName);
-
-            std::wstring output;
-            const DWORD code =
-                ops::RunPnputil(L"/add-driver \"" + inf + L"\" /install", output, *ctx.log);
-            if (code == 0)
+            std::vector<std::wstring> before, after;
+            if (!ops::EnumeratePublishedInfNames(kDrivers[i].infLeaf, kCameraInterfaceGuids[i], before))
             {
-                ctx.log->Line(L"%s driver installed", kDrivers[i].displayName);
-            }
-            else if (code == 259)   // ERROR_NO_MORE_ITEMS: staged, no device present
-            {
-                ctx.stagedDriver[i] = true;
-                ctx.log->Line(L"%s driver staged -- it binds automatically when the "
-                              L"camera is plugged in", kDrivers[i].displayName);
-            }
-            else if (code == 3010)  // ERROR_SUCCESS_REBOOT_REQUIRED
-            {
-                ctx.rebootRequired = true;
-                ctx.log->Line(L"%s driver installed -- Windows wants a reboot before "
-                              L"the camera works", kDrivers[i].displayName);
-            }
-            else
-            {
-                ctx.log->Line(L"error: %s driver installation failed (pnputil exit "
-                              L"code %lu)", kDrivers[i].displayName, code);
-                if (!output.empty())
-                    ctx.log->Line(L"pnputil output:\r\n%s", output.c_str());
-                ctx.log->Line(L"check that Secure Boot policy allows the self-signed "
-                              L"driver certificate");
+                ctx.log->Line(L"error: cannot inventory the driver store before installation");
                 return false;
             }
-
-            // Which package did we just add? pnputil says so exactly; the
-            // driver-store scan is only a fallback, and it cannot tell one of our
-            // packages from another of ours left by an earlier release.
-            if (!ops::PublishedNameFromPnputilOutput(output, ctx.oemInfName[i]))
-                ops::FindPublishedInfName(kDrivers[i].infLeaf, kCameraInterfaceGuids[i],
-                                          ctx.oemInfName[i]);
-
-            // "Pre-existing" means pnputil re-used what was already published, so
-            // this install added nothing to retract. Deciding that BEFORE the run --
-            // on nothing but "some package of ours exists" -- suppressed the rollback
-            // of a package we really had just added, because installs from earlier
-            // releases stay in the store and answer to the same name and GUID.
-            ctx.driverWasPreexisting[i] =
-                !ctx.oemInfName[i].empty() &&
-                _wcsicmp(ctx.oemInfName[i].c_str(), existingOem.c_str()) == 0;
-
-            if (!ctx.oemInfName[i].empty())
-                ctx.log->Line(L"%s driver package published as %s%s",
-                              kDrivers[i].displayName, ctx.oemInfName[i].c_str(),
-                              ctx.driverWasPreexisting[i] ? L" (already present)" : L"");
+            const std::wstring inf = ops::JoinPath(ctx.installDir,
+                (std::wstring(L"driver\\") + kDrivers[i].infLeaf).c_str());
+            std::wstring output;
+            const DWORD code = ops::RunPnputil(L"/add-driver \"" + inf + L"\" /install",
+                                               output, *ctx.log, ctx.cancel);
+            if (!ops::EnumeratePublishedInfNames(kDrivers[i].infLeaf, kCameraInterfaceGuids[i], after))
+            {
+                ctx.rollbackIncomplete = true;
+                ctx.log->Line(L"recovery: cannot inventory driver changes; manual verification required");
+                return false;
+            }
+            for (const auto& name : after)
+                if (std::find(before.begin(), before.end(), name) == before.end() &&
+                    ops::PublishedInfMatches(name, kDrivers[i].infLeaf, kCameraInterfaceGuids[i], &inf))
+                    ctx.newDriverPackages[i].push_back(name);
+            if (code != 0 && code != ERROR_NO_MORE_ITEMS && code != ERROR_SUCCESS_REBOOT_REQUIRED)
+            {
+                ctx.log->Line(L"error: %s driver installation failed (code %lu)\n%s",
+                              kDrivers[i].displayName, code, output.c_str());
+                return false;
+            }
+            ctx.stagedDriver[i] = code == ERROR_NO_MORE_ITEMS;
+            ctx.rebootRequired |= code == ERROR_SUCCESS_REBOOT_REQUIRED;
+            std::wstring published;
+            if (!ops::PublishedNameFromPnputilOutput(output, published) ||
+                !ops::PublishedInfMatches(published, kDrivers[i].infLeaf, kCameraInterfaceGuids[i], &inf))
+            {
+                published.clear();
+                for (const auto& name : after)
+                    if (ops::PublishedInfMatches(name, kDrivers[i].infLeaf, kCameraInterfaceGuids[i], &inf))
+                    {
+                        published = name;
+                        break;
+                    }
+            }
+            if (published.empty())
+            {
+                ctx.log->Line(L"error: cannot verify the published %s driver package",
+                              kDrivers[i].displayName);
+                return false;
+            }
+            ctx.oemInfName[i] = published;
+            ctx.log->Line(L"%s driver verified as %s", kDrivers[i].displayName, published.c_str());
         }
         return true;
     }
@@ -587,13 +733,25 @@ public:
     void Undo(SetupContext& ctx) noexcept override
     {
         for (int i = 2; i >= 0; --i)
-        {
-            if (ctx.driverWasPreexisting[i] || ctx.oemInfName[i].empty())
-                continue;   // never retract a package that predates this install
-            std::wstring output;
-            ops::RunPnputil(L"/delete-driver " + ctx.oemInfName[i] + L" /uninstall /force",
-                            output, *ctx.log);
-        }
+            for (const auto& name : ctx.newDriverPackages[i])
+            {
+                if (!ops::PublishedInfMatches(name, kDrivers[i].infLeaf, kCameraInterfaceGuids[i]))
+                {
+                    ctx.rollbackIncomplete = true;
+                    ctx.log->Line(L"recovery: refusing to delete unverified driver %s", name.c_str());
+                    continue;
+                }
+                std::wstring output;
+                const DWORD code = ops::RunPnputil(L"/delete-driver " + name + L" /uninstall /force",
+                                                   output, *ctx.log);
+                if (code == ERROR_SUCCESS_REBOOT_REQUIRED)
+                    ctx.rebootRequired = true;
+                else if (code != ERROR_SUCCESS)
+                {
+                    ctx.rollbackIncomplete = true;
+                    ctx.log->Line(L"recovery: cannot remove %s (code %lu)", name.c_str(), code);
+                }
+            }
     }
 };
 
@@ -618,11 +776,15 @@ public:
             if (ops::PathExists(src) && !FileMatchesSha1(dst, kFwSha1[i]) &&
                 FileMatchesSha1(src, kFwSha1[i]))
             {
-                if (CopyFileW(src.c_str(), dst.c_str(), FALSE))
-                {
-                    ctx.fwCopied[i] = true;
+                // Best-effort like the download below: the PS4 camera is
+                // optional, so a locked or unwritable cache must not roll back
+                // the whole install. The app re-verifies the bytes before use.
+                if (!PrepareWrite(ctx, dst, kFwFiles[i]) ||
+                    !CopyFileW(src.c_str(), dst.c_str(), FALSE))
+                    ctx.log->Line(L"warning: could not stage %s into %s (code %lu)",
+                                  kFwFiles[i], fwDir.c_str(), GetLastError());
+                else
                     ctx.log->Line(L"staged %s into %s", kFwFiles[i], fwDir.c_str());
-                }
             }
         }
 
@@ -657,13 +819,14 @@ public:
                                       kFwFiles[i], kFwHost, path);
                         continue;
                     }
-                    if (payload::WriteFileVerified(dst, blob.data(),
-                                                   (DWORD)blob.size(), *ctx.log))
-                    {
-                        ctx.fwCopied[i] = true;
+                    if (!PrepareWrite(ctx, dst, kFwFiles[i]) ||
+                        !payload::WriteFileVerified(dst, blob.data(),
+                                                    (DWORD)blob.size(), *ctx.log))
+                        ctx.log->Line(L"warning: could not write %s into %s",
+                                      kFwFiles[i], fwDir.c_str());
+                    else
                         ctx.log->Line(L"%s verified (SHA-1) and installed into %s",
                                       kFwFiles[i], fwDir.c_str());
-                    }
                     break;   // a write failure is a disk problem; mirrors won't help
                 }
             }
@@ -682,10 +845,21 @@ public:
 
     void Undo(SetupContext& ctx) noexcept override
     {
-        for (int i = 0; i < 2; ++i)
-            if (ctx.fwCopied[i])
-                DeleteFileW(ops::JoinPath(ops::ProgramDataDir(), kFwFiles[i]).c_str());
+        RestoreFiles(ctx, _written, _backups);
     }
+private:
+    bool PrepareWrite(SetupContext& ctx, const std::wstring& target, const wchar_t* leaf)
+    {
+        if (std::find(_written.begin(), _written.end(), target) != _written.end())
+            return true;
+        const std::wstring relative = std::wstring(L"firmware\\") + leaf;
+        if (!BackupFile(ctx, target, relative.c_str(), _backups))
+            return false;
+        _written.push_back(target);
+        return true;
+    }
+    std::vector<std::wstring> _written;
+    std::vector<std::pair<std::wstring, std::wstring>> _backups;
 };
 
 class SeedDefaultsStep : public Step
@@ -745,91 +919,108 @@ public:
 
     bool Run(SetupContext& ctx) override
     {
-        SnapshotArp(ctx.arpSnapshot);
-
-        HKEY key = nullptr;
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kArpKeyPath, 0, nullptr, 0,
-                            KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        LSTATUS status = ops::SnapshotRegistryTree(HKEY_LOCAL_MACHINE, kArpKeyPath, _previous);
+        if (status != ERROR_SUCCESS)
         {
-            ctx.log->Line(L"error: cannot create the Apps & Features entry (code %lu)",
-                          GetLastError());
+            ctx.log->Line(L"error: cannot snapshot the Apps & Features entry (code %ld)", status);
             return false;
         }
-
-        auto setString = [key](const wchar_t* name, const std::wstring& value) {
-            RegSetValueExW(key, name, 0, REG_SZ,
-                           reinterpret_cast<const BYTE*>(value.c_str()),
-                           static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+        _attempted = true;
+        HKEY key = nullptr;
+        status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kArpKeyPath, 0, nullptr, 0,
+                                 KEY_READ | KEY_WRITE, nullptr, &key, nullptr);
+        if (status != ERROR_SUCCESS)
+        {
+            ctx.log->Line(L"error: cannot create the Apps & Features entry (code %ld)", status);
+            return false;
+        }
+        auto setString = [&](const wchar_t* name, const std::wstring& value) {
+            if (status == ERROR_SUCCESS)
+                status = RegSetValueExW(key, name, 0, REG_SZ,
+                    reinterpret_cast<const BYTE*>(value.c_str()),
+                    static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
         };
-        auto setDword = [key](const wchar_t* name, DWORD value) {
-            RegSetValueExW(key, name, 0, REG_DWORD,
-                           reinterpret_cast<const BYTE*>(&value), sizeof(value));
+        auto setDword = [&](const wchar_t* name, DWORD value) {
+            if (status == ERROR_SUCCESS)
+                status = RegSetValueExW(key, name, 0, REG_DWORD,
+                                        reinterpret_cast<const BYTE*>(&value), sizeof(value));
         };
-
-        const std::wstring setupExe =
-            ops::JoinPath(ctx.installDir, L"PSCam4Win-Setup.exe");
+        const std::wstring setup = ops::JoinPath(ctx.installDir, L"PSCam4Win-Setup.exe");
         setString(L"DisplayName", L"PSCam4Win Virtual Camera");
         setString(L"DisplayVersion", L"" PSCAM_VERSION_DISPLAY);
         setString(L"Publisher", L"PSCam4Win");
         setString(L"InstallLocation", ctx.installDir);
         setString(L"DisplayIcon", ops::JoinPath(ctx.installDir, payload::kTrayExeName));
-        setString(L"UninstallString", L"\"" + setupExe + L"\" --uninstall");
-        setDword(L"NoModify", 1);
-        setDword(L"NoRepair", 1);
+        setString(L"UninstallString", L"\"" + setup + L"\" --uninstall");
+        setDword(L"NoModify", 1); setDword(L"NoRepair", 1);
         setDword(L"EstimatedSize", payload::TotalPayloadSizeKb());
         setDword(L"VersionMajor", PSCAM_VERSION_MAJOR);
         setDword(L"VersionMinor", PSCAM_VERSION_MINOR);
         for (int i = 0; i < 3; ++i)
             if (!ctx.oemInfName[i].empty())
                 setString(kDrivers[i].arpOemValue, ctx.oemInfName[i]);
+        setDword(L"CertOwnershipTracked", 1);
 
+        // An install that predates ownership tracking removed its payload
+        // certificates by thumbprint on uninstall and recorded nothing. Upgrading
+        // over it finds those certificates already present, so this install
+        // would record no ownership and its uninstall would leave them trusted
+        // forever. Adopt them: they are ours, put there by that earlier install.
+        std::vector<CertRecord> adopted;
+        if (ctx.arpState.installed && !ctx.arpState.certOwnershipTracked)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                CertRecord rec{};
+                if (!PayloadCertThumbprint(i, rec.thumbprint))
+                    continue;
+                const DWORD presence = ops::CertStorePresence(rec.thumbprint);
+                rec.addedToRoot = (presence & 1u) != 0;
+                rec.addedToTrustedPub = (presence & 2u) != 0;
+                if (presence)
+                {
+                    ctx.log->Line(L"adopting the %s driver certificate from the previous install",
+                                  kDrivers[i].displayName);
+                    adopted.push_back(rec);
+                }
+            }
+        }
+
+        std::vector<CertRecord> owned = ctx.certsAdded;
+        owned.insert(owned.end(), adopted.begin(), adopted.end());
+        for (const auto& cert : owned)
+        {
+            DWORD flags = (cert.addedToRoot ? 1u : 0u) | (cert.addedToTrustedPub ? 2u : 0u);
+            if (!flags)
+                continue;
+            const std::wstring name = ops::CertificateOwnershipName(cert.thumbprint);
+            DWORD previous = 0, bytes = sizeof(previous), type = 0;
+            if (RegQueryValueExW(key, name.c_str(), nullptr, &type,
+                                 reinterpret_cast<BYTE*>(&previous), &bytes) == ERROR_SUCCESS &&
+                type == REG_DWORD && bytes == sizeof(previous))
+                flags |= previous & 3u;
+            setDword(name.c_str(), flags);
+        }
         RegCloseKey(key);
-        return true;
+        if (status != ERROR_SUCCESS)
+            ctx.log->Line(L"error: cannot write installation metadata (code %ld)", status);
+        return status == ERROR_SUCCESS;
     }
 
     void Undo(SetupContext& ctx) noexcept override
     {
-        RegDeleteTreeW(HKEY_LOCAL_MACHINE, kArpKeyPath);
-        if (!ctx.arpSnapshot.existed)
+        if (!_attempted)
             return;
-        HKEY key = nullptr;
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kArpKeyPath, 0, nullptr, 0,
-                            KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS)
-            return;
-        for (const ArpSnapshot::Value& v : ctx.arpSnapshot.values)
-            RegSetValueExW(key, v.name.c_str(), 0, v.type, v.data.data(),
-                           static_cast<DWORD>(v.data.size()));
-        RegCloseKey(key);
-    }
-
-private:
-    static void SnapshotArp(ArpSnapshot& snapshot)
-    {
-        snapshot = ArpSnapshot{};
-        HKEY key = nullptr;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kArpKeyPath, 0, KEY_READ, &key) !=
-            ERROR_SUCCESS)
-            return;
-        snapshot.existed = true;
-        for (DWORD index = 0;; ++index)
+        const LSTATUS status = ops::RestoreRegistryTree(HKEY_LOCAL_MACHINE, kArpKeyPath, _previous);
+        if (status != ERROR_SUCCESS)
         {
-            wchar_t name[256];
-            DWORD nameLen = _countof(name);
-            DWORD type = 0;
-            BYTE data[2048];
-            DWORD dataLen = sizeof(data);
-            const LSTATUS status = RegEnumValueW(key, index, name, &nameLen, nullptr,
-                                                 &type, data, &dataLen);
-            if (status != ERROR_SUCCESS)
-                break;
-            ArpSnapshot::Value value;
-            value.name = name;
-            value.type = type;
-            value.data.assign(data, data + dataLen);
-            snapshot.values.push_back(std::move(value));
+            ctx.rollbackIncomplete = true;
+            ctx.log->Line(L"recovery: cannot restore installation metadata (code %ld)", status);
         }
-        RegCloseKey(key);
     }
+private:
+    bool _attempted = false;
+    ops::RegistryTree _previous;
 };
 
 // Shared by install and uninstall.
@@ -880,54 +1071,53 @@ class UDeleteDriversStep : public Step
 {
 public:
     const wchar_t* Name() const override { return L"Removing the WinUSB camera drivers"; }
-
     bool Run(SetupContext& ctx) override
     {
-        bool allOk = true;
+        bool ok = true;
+        auto deletePackage = [&](const std::wstring& name) {
+            std::wstring output;
+            const DWORD code = ops::RunPnputil(L"/delete-driver " + name + L" /uninstall /force",
+                                               output, *ctx.log, ctx.cancel);
+            if (code == ERROR_SUCCESS_REBOOT_REQUIRED)
+                ctx.rebootRequired = true;
+            else if (code != ERROR_SUCCESS)
+            {
+                ctx.log->Line(L"warning: cannot remove %s (code %lu)", name.c_str(), code);
+                ok = false;
+            }
+        };
+
+        // Every published package of ours, including the whole-device PS3 Eye
+        // package an early release shipped (same leaf name and interface GUID).
         for (int i = 0; i < 3; ++i)
         {
-            // Prefer the oem name recorded at install time; fall back to a
-            // driver-store scan (covers bat-era installs).
-            std::wstring oem = ctx.arpState.oemInf[i];
-            if (oem.empty())
-                ops::FindPublishedInfName(kDrivers[i].infLeaf, kCameraInterfaceGuids[i], oem);
-            if (oem.empty())
+            std::vector<std::wstring> names;
+            if (!ops::EnumeratePublishedInfNames(kDrivers[i].infLeaf, kCameraInterfaceGuids[i], names))
             {
-                ctx.log->Line(L"%s driver is not installed -- skipping",
-                              kDrivers[i].displayName);
+                ok = false;
                 continue;
             }
-
-            std::wstring output;
-            DWORD code = ops::RunPnputil(L"/delete-driver " + oem + L" /uninstall /force",
-                                         output, *ctx.log);
-            if (code != 0 && code != 3010)
+            for (const auto& name : names)
             {
-                // The recorded name may be stale after a re-publish; rescan once.
-                std::wstring rescanned;
-                if (ops::FindPublishedInfName(kDrivers[i].infLeaf,
-                                              kCameraInterfaceGuids[i], rescanned) &&
-                    _wcsicmp(rescanned.c_str(), oem.c_str()) != 0)
-                    code = ops::RunPnputil(L"/delete-driver " + rescanned +
-                                           L" /uninstall /force", output, *ctx.log);
-            }
-
-            if (code == 0)
-                ctx.log->Line(L"%s driver removed", kDrivers[i].displayName);
-            else if (code == 3010)
-            {
-                ctx.rebootRequired = true;
-                ctx.log->Line(L"%s driver removed -- a reboot completes the cleanup",
-                              kDrivers[i].displayName);
-            }
-            else
-            {
-                ctx.log->Line(L"warning: could not remove the %s driver (pnputil exit "
-                              L"code %lu)", kDrivers[i].displayName, code);
-                allOk = false;
+                // Verify package identity again immediately before deletion.
+                if (!ops::PublishedInfMatches(name, kDrivers[i].infLeaf, kCameraInterfaceGuids[i]))
+                {
+                    ctx.log->Line(L"warning: refusing to delete unverified driver %s", name.c_str());
+                    ok = false;
+                    continue;
+                }
+                deletePackage(name);
             }
         }
-        return allOk;
+
+        // The audio package an early release shipped is ours too.
+        std::vector<std::wstring> audio;
+        if (!ops::EnumerateLegacyPs3AudioInfNames(audio))
+            ok = false;
+        for (const auto& name : audio)
+            if (ops::PublishedInfIsLegacyPs3Audio(name))
+                deletePackage(name);
+        return ok;
     }
 };
 
@@ -935,37 +1125,30 @@ class URemoveCertsStep : public Step
 {
 public:
     const wchar_t* Name() const override { return L"Removing the driver-signing certificates"; }
-
     bool Run(SetupContext& ctx) override
     {
-        std::vector<std::vector<BYTE>> seen;
-        bool allOk = true;
-        for (int i = 0; i < 3; ++i)
+        std::vector<CertRecord> owned = ctx.arpState.ownedCertificates;
+        if (owned.empty() && ctx.arpState.installed && !ctx.arpState.certOwnershipTracked)
         {
-            BYTE thumb[20];
-            const std::wstring cerFile = ops::JoinPath(
-                ctx.installDir, (std::wstring(L"driver\\") + kDrivers[i].cerLeaf).c_str());
-            bool haveThumb = ops::ThumbprintOfCertFile(cerFile, thumb);
-            if (!haveThumb)
+            // An install from before ownership tracking: it put the payload
+            // certificates in both stores and expects uninstall to take them out.
+            for (int i = 0; i < 3; ++i)
             {
-                const BYTE* der = nullptr;
-                DWORD len = 0;
-                if (payload::GetResourceBytes(kDrivers[i].cerRes, der, len))
-                    haveThumb = ops::ThumbprintOfCertBytes(der, len, thumb);
+                CertRecord rec{};
+                if (!PayloadCertThumbprint(i, rec.thumbprint))
+                    continue;
+                rec.addedToRoot = rec.addedToTrustedPub = true;
+                owned.push_back(rec);
             }
-            if (!haveThumb)
-                continue;
-
-            bool duplicate = false;
-            for (const auto& previous : seen)
-                duplicate |= memcmp(previous.data(), thumb, 20) == 0;
-            if (duplicate)
-                continue;
-            seen.emplace_back(thumb, thumb + 20);
-
-            allOk &= ops::RemoveCertByThumbprint(thumb, true, true, *ctx.log);
         }
-        return allOk;
+        // Only certificates a PSCam4Win install put there are removed.
+        bool ok = true;
+        for (const auto& cert : owned)
+            ok &= ops::RemoveCertByThumbprint(cert.thumbprint, cert.addedToRoot,
+                                              cert.addedToTrustedPub, *ctx.log);
+        if (owned.empty())
+            ctx.log->Line(L"No installer-owned certificates recorded; existing trust is retained");
+        return ok;
     }
 };
 
@@ -1050,6 +1233,7 @@ std::vector<std::unique_ptr<Step>> BuildInstallSteps()
     steps.push_back(std::make_unique<ExtractPayloadStep>());
     steps.push_back(std::make_unique<RegisterComStep>());
     steps.push_back(std::make_unique<InstallCertsStep>());
+    steps.push_back(std::make_unique<RetireOldPs3DriversStep>());
     steps.push_back(std::make_unique<InstallDriversStep>());
     steps.push_back(std::make_unique<StageFirmwareStep>());
     steps.push_back(std::make_unique<SeedDefaultsStep>());
@@ -1083,7 +1267,7 @@ EngineResult Run(std::vector<std::unique_ptr<Step>>& steps, SetupContext& ctx)
     const int total = CountApplicable(steps, ctx);
     NotifyProgress(ctx, 0, total);
 
-    std::vector<Step*> completed;
+    std::vector<Step*> attempted;
     EngineResult result = EngineResult::Success;
     int index = 0;
     for (const auto& step : steps)
@@ -1098,12 +1282,12 @@ EngineResult Run(std::vector<std::unique_ptr<Step>>& steps, SetupContext& ctx)
         }
         ++index;
         ctx.log->Line(L"=== (%d/%d) %s", index, total, step->Name());
+        attempted.push_back(step.get());
         if (!step->Run(ctx))
         {
-            result = EngineResult::Failed;
+            result = ctx.cancel && ctx.cancel->load() ? EngineResult::Cancelled : EngineResult::Failed;
             break;
         }
-        completed.push_back(step.get());
         NotifyProgress(ctx, index, total);
     }
 
@@ -1112,15 +1296,18 @@ EngineResult Run(std::vector<std::unique_ptr<Step>>& steps, SetupContext& ctx)
         ctx.log->Line(result == EngineResult::Cancelled
                           ? L"--- rolling back the cancelled install..."
                           : L"--- install failed, rolling back...");
-        for (auto it = completed.rbegin(); it != completed.rend(); ++it)
+        for (auto it = attempted.rbegin(); it != attempted.rend(); ++it)
         {
             ctx.log->Line(L"undo: %s", (*it)->Name());
             (*it)->Undo(ctx);
         }
-        ctx.log->Line(L"rollback finished");
+        ctx.log->Line(ctx.rollbackIncomplete ? L"recovery incomplete; retained backups: %s"
+                                             : L"rollback finished", ctx.backupDir.c_str());
+        if (ctx.rollbackIncomplete)
+            result = EngineResult::Failed;
     }
 
-    if (!ctx.backupDir.empty())
+    if (!ctx.backupDir.empty() && !ctx.rollbackIncomplete)
         ops::DeleteTempDirectory(ctx.backupDir, *ctx.log);
 
     if (result == EngineResult::Success)

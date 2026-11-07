@@ -17,13 +17,15 @@
 namespace
 {
 constexpr UINT kTrayIconId = 1;
+
+constexpr UINT_PTR kFpsTimer      = 1;   // tooltip fps refresh, armed while streaming
+constexpr UINT_PTR kMicProbeTimer = 2;   // one-shot: run the PS3 Eye mic probe
 }
 
 bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
 {
     _instance = instance;
     _controllers = controllers;
-    _controller = &controllers[0];
 
     LoadIconMetric(instance, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &_icon);
 
@@ -48,7 +50,7 @@ bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
     ChangeWindowMessageFilterEx(_hwnd, _taskbarCreatedMsg, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(_hwnd, WM_SHOW_SETTINGS, MSGFLT_ALLOW, nullptr);
 
-    // Subscribe to each camera interface (PS3 Eye + EyeToy) arrival/removal so
+    // Subscribe to each camera interface (PS3 Eye, EyeToy, PS4) arrival/removal so
     // the capture threads can re-evaluate slot occupancy immediately instead of
     // polling. One registration per GUID; DBT_DEVICEARRIVAL/REMOVECOMPLETE for
     // any of them lands in the same WndProc handler.
@@ -66,7 +68,7 @@ bool TrayUI::Create(HINSTANCE instance, CaptureController* controllers)
     // A camera wedged before we started is the case prevention cannot reach —
     // the state was left on the chip by an earlier session, and only a replug
     // clears it. Ask once, after the shell and usbaudio have settled.
-    SetTimer(_hwnd, 2, 8000, nullptr);
+    SetTimer(_hwnd, kMicProbeTimer, 8000, nullptr);
     return true;
 }
 
@@ -201,7 +203,7 @@ void TrayUI::ShowBalloon(const wchar_t* title, const wchar_t* text)
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-void TrayUI::ApplySettings(int cameraIndex, const Settings& s, bool persistNow)
+void TrayUI::ApplySettings(int cameraIndex, const Settings& s, bool persistNow, bool quiet)
 {
     if (cameraIndex < 0 || cameraIndex >= kVCamCount)
         return;
@@ -213,7 +215,8 @@ void TrayUI::ApplySettings(int cameraIndex, const Settings& s, bool persistNow)
     // behind a live external client. When the preview is the only consumer
     // (or the camera isn't streaming), the mode applies immediately on the
     // next sleep transition — no need to bother the user.
-    if (_controllers[cameraIndex].GetState() == CaptureController::State::Streaming &&
+    if (!quiet &&
+        _controllers[cameraIndex].GetState() == CaptureController::State::Streaming &&
         !s.SameMode(_controllers[cameraIndex].ActiveSettings()) &&
         !_controllers[cameraIndex].IsPreviewOnly())
     {
@@ -287,7 +290,7 @@ void TrayUI::OnCommand(int id)
     switch (id)
     {
     case IDM_SETTINGS:
-        settingsdialog::Show(_instance, _controller);
+        settingsdialog::Show(_instance, _controllers);
         break;
     case IDM_AUTOSTART:
         if (autostart::IsEnabled())
@@ -346,7 +349,7 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case NIN_SELECT:
         case NIN_KEYSELECT:
         case WM_LBUTTONDBLCLK:
-            settingsdialog::Show(_instance, _controller);
+            settingsdialog::Show(_instance, _controllers);
             break;
         case WM_CONTEXTMENU:
         {
@@ -373,7 +376,7 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 // usbaudio has not built the endpoint yet at DBT_DEVICEARRIVAL,
                 // and probing now would just read Unknown.
                 micwatch::Reset();
-                SetTimer(hwnd, 2, 4000, nullptr);
+                SetTimer(hwnd, kMicProbeTimer, 4000, nullptr);
             }
         }
         return TRUE;
@@ -387,12 +390,12 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 anyStreaming = (_controllers[i].GetState() == CaptureController::State::Streaming);
             if (anyStreaming && !_fpsTimerOn)
             {
-                SetTimer(hwnd, 1, 3000, nullptr);
+                SetTimer(hwnd, kFpsTimer, 3000, nullptr);
                 _fpsTimerOn = true;
             }
             else if (!anyStreaming && _fpsTimerOn)
             {
-                KillTimer(hwnd, 1);
+                KillTimer(hwnd, kFpsTimer);
                 _fpsTimerOn = false;
             }
         }
@@ -417,29 +420,64 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
 
     case WM_SHOW_SETTINGS:  // second app instance launched
-        settingsdialog::Show(_instance, _controller);
+        settingsdialog::Show(_instance, _controllers);
         return 0;
 
     case WM_TIMER:
-        if (wParam == 1)
-            UpdateTooltip();  // periodic fps refresh while streaming
-        else if (wParam == 2)
+        if (wParam == kFpsTimer)
+            UpdateTooltip();
+        else if (wParam == kMicProbeTimer)
         {
-            KillTimer(hwnd, 2);   // one-shot: fires once per device change
+            KillTimer(hwnd, kMicProbeTimer);   // one-shot
             micwatch::CheckPs3Async(hwnd, WM_MIC_HEALTH);
         }
         return 0;
 
     case WM_MIC_HEALTH:
-        // Only Wedged is worth interrupting anyone over. Unknown means the probe
-        // could not tell (no camera, endpoint busy) and must never be dressed up
-        // as a fault; Alive is the expected case and says nothing.
-        if (static_cast<micwatch::Health>(wParam) == micwatch::Health::Wedged)
+        // Only actionable faults interrupt anyone. Unknown means the probe could
+        // not tell (no camera, endpoint busy, endpoint not built yet) and must
+        // never be dressed up as a fault; Alive is the expected case.
+        switch (static_cast<micwatch::Health>(wParam))
         {
+        case micwatch::Health::Wedged:
             ShowBalloon(L"PS3 Eye microphone — please replug",
                         L"The camera's microphone has stopped delivering audio. "
                         L"Unplug the PS3 Eye and plug it back in — nothing else "
                         L"recovers it, and the video is unaffected.");
+            break;
+        case micwatch::Health::WholeDeviceDriver:
+        {
+            // A driver bound to the whole camera hides the microphone from
+            // Windows entirely. Removing it is the user's call: it may belong
+            // to another app they still use.
+            wchar_t text[256];
+            _snwprintf_s(text, _TRUNCATE,
+                         L"Another driver (%s) owns the whole PS3 Eye, so Windows cannot "
+                         L"load its microphone. Remove it in Device Manager (uninstall the "
+                         L"PS3 Eye and delete its driver), then replug the camera.",
+                         micwatch::LastPs3Detail().c_str());
+            ShowBalloon(L"PS3 Eye microphone unavailable", text);
+            break;
+        }
+        case micwatch::Health::AudioDriverError:
+        {
+            wchar_t text[256];
+            _snwprintf_s(text, _TRUNCATE,
+                         L"The PS3 Eye's microphone driver failed to start (%s). Replug the "
+                         L"camera; if it persists, uninstall \"USB Camera-B4.09.24.1\" under "
+                         L"Sound, video and game controllers in Device Manager and replug.",
+                         micwatch::LastPs3Detail().c_str());
+            ShowBalloon(L"PS3 Eye microphone unavailable", text);
+            break;
+        }
+        case micwatch::Health::EndpointDisabled:
+            ShowBalloon(L"PS3 Eye microphone is disabled",
+                        L"Enable \"Microphone (USB Camera-B4.09.24.1)\" in Settings > "
+                        L"System > Sound > All sound devices, or in the Sound control "
+                        L"panel's Recording tab.");
+            break;
+        default:
+            break;
         }
         settingsdialog::RefreshStatus();
         return 0;
@@ -449,7 +487,7 @@ LRESULT TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
 
     case WM_DESTROY:
-        KillTimer(hwnd, 1);
+        KillTimer(hwnd, kFpsTimer);
         // If the tray window dies for any reason the app must exit with it
         // (redundant during normal shutdown, where the loop has already left).
         PostQuitMessage(0);

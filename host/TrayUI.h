@@ -23,7 +23,10 @@ public:
     // Apply a settings snapshot to the controller and persist it; shows the
     // "mode change deferred" balloon when applicable. Used by both the menu
     // and the settings dialog.
-    void ApplySettings(int cameraIndex, const Settings& s, bool persistNow);
+    // quiet: the caller is about to rescan, which re-creates the device in the
+    // new mode itself, so "deferred" would be false.
+    void ApplySettings(int cameraIndex, const Settings& s, bool persistNow,
+                       bool quiet = false);
 
     // Nudge every controller to re-evaluate slot occupancy (same path as a USB
     // device-change). Used when a setting changes the slot MAP rather than one
@@ -45,12 +48,11 @@ private:
     HINSTANCE          _instance = nullptr;
     HWND               _hwnd = nullptr;
     HICON              _icon = nullptr;
-    CaptureController* _controllers = nullptr;
-    CaptureController* _controller = nullptr;
+    CaptureController* _controllers = nullptr;   // kVCamCount entries, indexed by slot
     UINT               _taskbarCreatedMsg = 0;
     bool               _iconAdded = false;
     bool               _fpsTimerOn = false;   // armed only while streaming
-    // One subscription per camera interface GUID (PS3 Eye + EyeToy); arrival or
-    // removal of any wakes the capture threads to re-evaluate slot occupancy.
+    // One subscription per camera interface GUID (PS3 Eye, EyeToy, PS4); arrival
+    // or removal of any wakes the capture threads to re-evaluate slot occupancy.
     HDEVNOTIFY         _devNotify[kCameraInterfaceGuidCount] = {};
 };

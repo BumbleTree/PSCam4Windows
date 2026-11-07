@@ -221,13 +221,12 @@ void Widget::ReleaseBuffer()
 {
     if (_memDc)
     {
-        SelectObject(_memDc, _memOld);
-        DeleteObject(_memBmp);
+        if (_memOld && _memOld != HGDI_ERROR) SelectObject(_memDc, _memOld);
         DeleteDC(_memDc);
-        _memDc = nullptr;
-        _memBmp = nullptr;
-        _memW = _memH = 0;
     }
+    if (_memBmp) DeleteObject(_memBmp);
+    _memDc = nullptr; _memBmp = nullptr; _memOld = nullptr;
+    _memW = _memH = 0;
 }
 
 void Widget::PaintBuffered()
@@ -247,8 +246,10 @@ void Widget::PaintBuffered()
             if (_memDc && _memBmp)
             {
                 _memOld = SelectObject(_memDc, _memBmp);
-                _memW = w; _memH = h;
+                if (_memOld && _memOld != HGDI_ERROR) { _memW = w; _memH = h; }
+                else ReleaseBuffer();
             }
+            else ReleaseBuffer();
         }
         if (_memDc && _memW == w)
         {
@@ -328,6 +329,11 @@ LRESULT CALLBACK Widget::Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (self->_enabled && self->OnKey(wp))
             return 0;
         break;
+
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE:
+        self->OnMouse(msg, POINT{});
+        return 0;
 
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
@@ -505,6 +511,16 @@ bool SliderRow::OnMouse(UINT msg, POINT pt)
 
     switch (msg)
     {
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        if (_dragging)
+        {
+            _dragging = false;
+            if (GetCapture() == _h) ReleaseCapture();
+            Invalidate();
+            if (onCommit) onCommit();
+        }
+        return true;
     case WM_LBUTTONDBLCLK:
     case WM_LBUTTONDOWN:
         SetFocus(_h);
@@ -651,6 +667,12 @@ bool ToggleRow::OnMouse(UINT msg, POINT pt)
 {
     switch (msg)
     {
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        _pressed = false;
+        if (GetCapture() == _h) ReleaseCapture();
+        Invalidate();
+        return true;
     case WM_LBUTTONDOWN:
         SetFocus(_h);
         _pressed = true;
@@ -779,9 +801,10 @@ bool Button::Create(HWND parent, const RECT& px, const wchar_t* text, Kind kind)
 
 void Button::SetText(const wchar_t* text)
 {
-    if (_text == text)
+    const wchar_t* t = text ? text : L"";
+    if (_text == t)
         return;
-    _text = text ? text : L"";
+    _text = t;
     SetWindowTextW(_h, _text.c_str());
     Invalidate();
 }
@@ -817,6 +840,13 @@ void Button::OnPaint(HDC dc, const RECT& client)
 
 bool Button::OnMouse(UINT msg, POINT pt)
 {
+    if (msg == WM_CANCELMODE || msg == WM_CAPTURECHANGED)
+    {
+        _pressed = false;
+        if (GetCapture() == _h) ReleaseCapture();
+        Invalidate();
+        return true;
+    }
     // Swallowed rather than treated as a fresh press: Record would otherwise
     // start and immediately stop on a double-click.
     if (msg == WM_LBUTTONDBLCLK)
@@ -1121,12 +1151,17 @@ void Combo::DrawItem(const DRAWITEMSTRUCT* d)
 
     theme::Fill(d->hDC, d->rcItem, sel ? p.accent : p.bgElevated);
 
-    wchar_t text[512] = {};
-    SendMessageW(d->hwndItem, CB_GETLBTEXT, d->itemID, (LPARAM)text);
+    // Sized from CB_GETLBTEXTLEN: CB_GETLBTEXT has no buffer-size argument, and
+    // the mic-output items carry driver-supplied endpoint names.
+    const LRESULT len = SendMessageW(d->hwndItem, CB_GETLBTEXTLEN, d->itemID, 0);
+    if (len == CB_ERR)
+        return;
+    std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+    SendMessageW(d->hwndItem, CB_GETLBTEXT, d->itemID, (LPARAM)text.data());
     RECT t = d->rcItem;
     t.left += theme::Dp(8);
     t.right -= theme::Dp(4);
-    theme::Text(d->hDC, t, text, theme::Font::Body,
+    theme::Text(d->hDC, t, text.c_str(), theme::Font::Body,
                 dis ? p.fgDisabled : (sel ? p.bg : p.fg),
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }

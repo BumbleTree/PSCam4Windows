@@ -77,14 +77,6 @@ Settings Defaults()
     return Settings{};  // struct in-class defaults are the sensor factory values
 }
 
-int FindModeIndex(uint32_t w, uint32_t h, uint32_t fps)
-{
-    for (int i = 0; i < kVideoModeCount; ++i)
-        if (kVideoModes[i].width == w && kVideoModes[i].height == h && kVideoModes[i].fps == fps)
-            return i;
-    return -1;
-}
-
 Settings Load(int cameraIndex)
 {
     Settings s;  // struct defaults

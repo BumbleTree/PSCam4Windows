@@ -1,9 +1,9 @@
 #pragma once
 //
-// Native system primitives for the installer. Everything the old batch files
-// did with net/taskkill/regsvr32/certutil/reg/schtasks is done through the
-// real APIs here, so each step gets a concrete error code instead of a
-// swallowed errorlevel. The only child processes ever spawned are
+// Native system primitives for the installer. Services, processes, COM
+// registration, certificates, the registry and scheduled tasks are all driven
+// through their APIs, so each step gets a concrete error code. The only child
+// processes ever spawned are
 // %SystemRoot%\System32\pnputil.exe (driver store operations -- its staged /
 // reboot-required exit codes are load-bearing) and the installed tray app's
 // one-shot verbs (--seed-defaults / --enable-autostart).
@@ -29,8 +29,11 @@ struct InstallState
 {
     bool         installed = false;
     std::wstring displayVersion;
-    std::wstring installLocation;
-    std::wstring oemInf[3];          // persisted PnpOem_* values (may be empty)
+    std::vector<CertRecord> ownedCertificates;   // OwnedCertificate_<thumbprint> values
+    // Set by every install that records certificate ownership. An install
+    // without it predates ownership tracking and removed its certificates by
+    // payload thumbprint on uninstall.
+    bool certOwnershipTracked = false;
 };
 
 namespace ops
@@ -67,37 +70,61 @@ void DeleteVCamClsids(Logger& log);
 
 // ---- certificates ------------------------------------------------------------
 bool ThumbprintOfCertBytes(const BYTE* der, DWORD len, BYTE out[20]);
-bool ThumbprintOfCertFile(const std::wstring& path, BYTE out[20]);
 // Adds to LocalMachine Root + TrustedPublisher, recording per-store whether we
 // actually added it (pre-existing entries are left alone and not removed later).
 bool AddCertToSystemStores(const BYTE* der, DWORD len, CertRecord& rec, Logger& log);
 bool RemoveCertByThumbprint(const BYTE thumb[20], bool fromRoot, bool fromTrustedPub, Logger& log);
+// Which LocalMachine stores hold the certificate: bit 0 Root, bit 1 TrustedPublisher.
+DWORD CertStorePresence(const BYTE thumb[20]);
+// ARP value name recording ownership of one certificate:
+// "OwnedCertificate_<lowercase hex thumbprint>", REG_DWORD of CertStorePresence bits.
+std::wstring CertificateOwnershipName(const BYTE thumb[20]);
 
 // ---- drivers -----------------------------------------------------------------
 // Runs %SystemRoot%\System32\pnputil.exe <args>, captures combined output,
 // returns the raw exit code (0 / 259 staged / 3010 reboot / other = error).
-DWORD RunPnputil(const std::wstring& args, std::wstring& output, Logger& log);
-// Locale-independent oemNN.inf lookup: scans C:\Windows\INF\oem*.inf and
-// matches each package's driver-store INF leaf name against originalLeafName.
-// Finds the published oem*.inf for one of OUR driver packages: the original
-// leaf name matches AND the package declares `interfaceGuid`.
-//
-// The GUID is what makes this ours. A Zadig/libwdi package for the same camera
-// carries the same original INF name and a DIFFERENT, randomly generated
-// interface GUID -- and matching on the name alone picks whichever the INF
-// directory lists first. That is how a rollback can retract, or an uninstall
-// delete, a package this installer never staged. Provider name cannot be used
-// for this: our own pre-rebrand packages were themselves stamped "libwdi".
-bool FindPublishedInfName(const wchar_t* originalLeafName, const GUID& interfaceGuid,
-                          std::wstring& oemName);
+DWORD RunPnputil(const std::wstring& args, std::wstring& output, Logger& log,
+                 std::atomic<bool>* cancel = nullptr);
+// Runs `exe` inside a kill-on-close job with stdout/stderr captured (UTF-16
+// with BOM, else OEM code page). Returns the process exit code, or the Win32
+// error that stopped it (ERROR_CANCELLED, ERROR_TIMEOUT, launch failure).
+// A cancelled or timed-out child is terminated and waited for before return.
+DWORD RunProcessCaptured(const std::wstring& exe, const std::wstring& args,
+                         std::wstring& output, Logger& log,
+                         std::atomic<bool>* cancel, DWORD timeoutMs);
 
-// The oemNNN.inf name pnputil says it published, pulled out of its output.
-// This is the only EXACT answer to "which package did we just add": several of
-// our own packages from earlier releases can share the original INF name and
-// the interface GUID, so a driver-store scan cannot tell them apart.
+// Is published package `oemName` (a bare "oemNN.inf" leaf) one of OUR driver
+// packages: its driver-store INF leaf name equals originalLeafName AND it
+// declares `interfaceGuid` -- and, with `exactInf`, its bytes equal that file.
 //
-// Matched by the value's shape rather than its label, because pnputil's output
-// is localized and "Published Name" is not.
+// The GUID is what makes it ours. A Zadig/libwdi package for the same camera
+// carries the same original INF name and a DIFFERENT, randomly generated
+// interface GUID; matching on the name alone would let a rollback retract, or
+// an uninstall delete, a package this installer never staged. Provider name
+// cannot be used for this: our own pre-rebrand packages were themselves
+// stamped "libwdi".
+bool PublishedInfMatches(const std::wstring& oemName, const wchar_t* originalLeafName,
+                         const GUID& interfaceGuid, const std::wstring* exactInf = nullptr);
+// Every %WINDIR%\INF\oem*.inf for which PublishedInfMatches holds.
+// Locale-independent (no pnputil text parsing). False when the scan fails.
+bool EnumeratePublishedInfNames(const wchar_t* originalLeafName, const GUID& interfaceGuid,
+                                std::vector<std::wstring>& names);
+
+// The INF's [Strings] DeviceID equals `deviceId` exactly (case-insensitive).
+// Distinguishes a whole-device package ("VID_1415&PID_2000") from an
+// interface one ("VID_1415&PID_2000&MI_00") without parsing [Models].
+bool InfDeviceIdIs(const std::wstring& infPath, const wchar_t* deviceId);
+
+// Published packages of the PS3 Eye AUDIO driver an early release shipped
+// (original name usb_audio.inf, [Version] Provider "PS3EyeVCam", bound to
+// MI_01). It has no interface GUID, so the provider string -- our old product
+// name -- is what identifies it as ours.
+bool EnumerateLegacyPs3AudioInfNames(std::vector<std::wstring>& names);
+bool PublishedInfIsLegacyPs3Audio(const std::wstring& oemName);
+
+// A unique oemNNN.inf candidate from localized pnputil output. Ambiguous
+// names are refused. Callers must verify package identity and exact INF bytes
+// before recording it; output text alone does not establish ownership.
 bool PublishedNameFromPnputilOutput(const std::wstring& output, std::wstring& oemName);
 
 // ---- scheduled tasks -----------------------------------------------------------
@@ -107,6 +134,20 @@ bool DeleteScheduledTask(const wchar_t* name, Logger& log);   // missing task = 
 // ---- registry -------------------------------------------------------------------
 bool RegKeyExists(HKEY root, const wchar_t* path);
 LSTATUS CopyRegTree(HKEY root, const wchar_t* srcPath, const wchar_t* dstPath);
+
+struct RegistryTree
+{
+    struct Key
+    {
+        struct Value { std::wstring name; DWORD type = 0; std::vector<BYTE> data; };
+        std::wstring path;
+        std::vector<Value> values;
+    };
+    bool existed = false;
+    std::vector<Key> keys;
+};
+LSTATUS SnapshotRegistryTree(HKEY root, const wchar_t* path, RegistryTree& snapshot);
+LSTATUS RestoreRegistryTree(HKEY root, const wchar_t* path, const RegistryTree& snapshot);
 
 // ---- files / processes -------------------------------------------------------------
 // Recursive delete restricted to an exact-match whitelist: the install dir,

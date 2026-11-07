@@ -1,7 +1,5 @@
 #include "EyeToyUsb.h"
 
-#include "../../common/UsbCore.h"
-
 // Facade over usbcore (common/UsbCore.h): the EyeToy VID/PIDs, and ctx #2.
 
 namespace eyetoy {
@@ -9,11 +7,6 @@ namespace eyetoy {
 bool IsEyeToy(unsigned short vid, unsigned short pid)
 {
     return vid == 0x054C && (pid == 0x0154 || pid == 0x0155);
-}
-
-std::string PortPath(libusb_device* dev)
-{
-    return usbcore::PortPath(dev);
 }
 
 std::vector<std::string> EnumeratePortPaths()

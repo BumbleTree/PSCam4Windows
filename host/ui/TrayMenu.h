@@ -15,7 +15,7 @@ class CaptureController;
 
 namespace traymenu {
 
-// Items within one camera's block. Modes occupy kModeBase upward.
+// Items within one camera's block. Modes occupy ItemModeBase upward.
 enum Item : int
 {
     ItemFlipH = 0,

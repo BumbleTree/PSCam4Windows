@@ -18,7 +18,8 @@
 // Number of supported camera slots; sized to match every array below.
 inline constexpr int kVCamCount = 8;
 
-// Arrays of 8 distinct static CLSIDs and details for multi-camera support.
+// One CLSID per slot; kVCamClsidStrings holds the same values in registry
+// string form, index for index.
 inline constexpr GUID CLSID_PS3EyeVCams[kVCamCount] = {
     { 0xe5c9a2d4, 0x7b3f, 0x4c81, { 0x9a, 0x06, 0x2f, 0x51, 0xd0, 0x8b, 0x6e, 0x73 } },
     { 0xe5c9a2d5, 0x7b3f, 0x4c81, { 0x9a, 0x06, 0x2f, 0x51, 0xd0, 0x8b, 0x6e, 0x73 } },

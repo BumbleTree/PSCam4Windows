@@ -44,12 +44,13 @@ PS3 Eye (Composite Device) ───┤                                         
 ## How to Install & Uninstall
 
 ### Installation
-1. Download **`PSCam4Win-Setup.exe`** from the [latest release](../../releases/latest). The public release workflow requires SignPath signing of the installer, payload, and driver catalogs; availability depends on project approval. Check the downloaded file's Digital Signatures before running it. Local `build.bat` output is an unsigned development installer, not an equivalent signed release. See [code signing policy](CODE_SIGNING.md).
+1. Download **`PSCam4Win-Setup.exe`** from the [latest release](../../releases/latest), or build it yourself with `build.bat` (see *Architecture & Technical Notes*). Release installers are built by GitHub Actions from the tagged source.
 2. Double-click it and accept the elevation prompt. The setup wizard will:
    * Let you choose which camera drivers to install (PS3 Eye / PS2 EyeToy / PS4 Camera) and whether to start at logon.
    * Upgrade any older **PS3EyeVCam** install in place (migrating your saved per-camera settings, then removing the old app, task, and registration).
    * Copy files to `C:\Program Files\PSCam4Win` (required for system camera integration).
-   * Install the selected WinUSB video drivers. Public release builds do not add certificates to **Trusted Root Certification Authorities** or **Trusted Publishers**; Windows handles publisher approval. Local development builds use self-signed catalogs and add their certificates to both machine stores, as disclosed in setup. Do not distribute development installers as signed public releases.
+   * Install the selected WinUSB video drivers. Their catalogs are self-signed, so setup adds each selected driver's certificate to the machine's **Trusted Root Certification Authorities** and **Trusted Publishers** stores (Windows will not install a self-signed driver otherwise), as the wizard explains before you start. Uninstalling removes them again.
+   * Remove driver packages from earlier PSCam4Win releases that stop Windows from loading the PS3 Eye's microphone.
    * Register the Virtual Camera DLL (handling all 8 camera CLSIDs).
    * Create an Apps & Features entry, set up the silent logon task, and launch the tray controller.
 3. Every step is shown live in the wizard and written to `C:\ProgramData\PSCam4Win\install.log`. If anything fails, setup **rolls back automatically** — no half-installed leftovers.
@@ -58,7 +59,7 @@ Running the installer again offers **Reinstall / repair** and **Uninstall**.
 
 ### Uninstallation
 1. Use **Windows Settings → Apps → Installed apps → PSCam4Win Virtual Camera → Uninstall** (or run `PSCam4Win-Setup.exe` again and pick Uninstall).
-2. It stops the services, deletes the scheduled task, unregisters all CLSIDs, removes the video drivers and their certificates, deletes the Apps & Features entry, and removes all installed files.
+2. It stops the services, deletes the scheduled task, unregisters all CLSIDs, removes every video driver package PSCam4Win has installed (including ones from earlier releases) and the driver-signing certificates PSCam4Win added, deletes the Apps & Features entry, and removes all installed files.
 3. Your saved camera settings and the PS4 firmware cache are **kept by default** (so a reinstall picks them right back up) — tick *"Also remove saved camera settings and the PS4 firmware cache"* in the uninstaller for a scorched-earth removal.
 
 ---
@@ -174,3 +175,6 @@ This project is licensed under the **GNU General Public License v2.0** (GPLv2) -
 ### Third-Party Components & Licenses:
 * **PS3EYEDriver wrapper** (`third_party/ps3eye/`): Ported from the [inspirit/PS3EYEDriver](https://github.com/inspirit/PS3EYEDriver) library, which is derived from the Linux Kernel `gspca_ov534` driver and licensed under the **GNU General Public License v2.0**.
 * **libusb**: Used for low-level USB communications, licensed under the **GNU Lesser General Public License v2.1** (LGPLv2.1) or later.
+* **libjpeg-turbo**: Used for JPEG decoding/encoding, under the IJG and BSD licenses. This software is based in part on the work of the Independent JPEG Group.
+
+The installer includes [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) with the component notices and vendored license texts.

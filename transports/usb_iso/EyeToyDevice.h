@@ -3,8 +3,8 @@
 // EyeToyDevice — ICameraDevice for the PS2 EyeToy (OmniVision OV519 bridge +
 // OV7648 sensor) over WinUSB isochronous via the vendored libusb 1.0.27.
 //
-// Pipeline (additive; the PS3 Eye path is untouched):
-//   EyeToyUsb event thread  --iso completion-->  IsoCallback (this file)
+// Pipeline:
+//   EyeToyUsb event thread  --iso completion-->  HandleTransfer (this file)
 //      reassembles OV519 SOF/EOF-framed packets into a complete JFIF frame
 //      --> 1-deep mailbox (overwrite-newest, lock + condvar)
 //   capture thread          --AcquireFrame-->    waits the mailbox, then
@@ -42,7 +42,7 @@ public:
     const DeviceProfile& Profile() const override;
 
 private:
-    // iso completion entry (static thunk -> OnIsoPacket reassembly).
+    // iso completion entry (static thunk -> HandleTransfer reassembly).
     static void OnTransfer(libusb_transfer* xfer);
     void HandleTransfer(libusb_transfer* xfer);
     void OnFrameComplete(const uint8_t* jpeg, uint32_t len);  // deliver to mailbox
@@ -55,8 +55,8 @@ private:
 
     uint32_t _width = 320, _height = 240, _fps = 30;
 
-    // Software image flip applied during the YUY2 repack (the OV7648 has no
-    // hardware flip register in the proven driver path). Latched by ApplySettings
+    // Software image flip applied during the YUY2 repack (the gspca bring-up
+    // this driver follows has no hardware flip for the OV7648). Latched by ApplySettings
     // and read by DecodeJpegToYuy2 — both run on the capture thread, so no sync.
     bool _flipH = false, _flipV = false;
 

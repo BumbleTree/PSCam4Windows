@@ -1,5 +1,6 @@
 #include "TrayMenu.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -21,16 +22,14 @@ struct Entry
     std::wstring text;
     bool checked = false;
     bool header  = false;   // a camera name: bold, not selectable
-    bool sep     = false;
 };
 
-std::vector<Entry*> g_entries;
+std::vector<std::unique_ptr<Entry>> g_entries;
 
 Entry* NewEntry(std::wstring text, bool checked = false, bool header = false)
 {
-    Entry* e = new Entry{ std::move(text), checked, header, false };
-    g_entries.push_back(e);
-    return e;
+    g_entries.push_back(std::make_unique<Entry>(Entry{ std::move(text), checked, header }));
+    return g_entries.back().get();
 }
 
 void Append(HMENU m, UINT flags, UINT_PTR id, Entry* e)
@@ -201,8 +200,6 @@ void DrawItem(const DRAWITEMSTRUCT* dis)
 
 void Cleanup()
 {
-    for (Entry* e : g_entries)
-        delete e;
     g_entries.clear();
 }
 

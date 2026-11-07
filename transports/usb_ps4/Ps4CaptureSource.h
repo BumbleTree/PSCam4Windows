@@ -5,22 +5,25 @@
 // This is the refcounted singleton (keyed by USB port path) at the centre of the
 // "logical views over a shared source" design. It owns the single libusb handle,
 // the firmware upload, the startup replay, the isochronous ring, and the frame
-// reassembly. It publishes the latest LEFT and RIGHT raw-Bayer eye planes into a
-// multi-reader latch; one or more Ps4ViewDevice adapters (Left / Right / SBS)
-// crop+demosaic off that latch into their own virtual cameras.
+// reassembly. It publishes the latest LEFT and RIGHT eye planes (YUY2 from the
+// OV580's ISP by default, raw Bayer in RAW mode) into a multi-reader latch; one
+// or more Ps4ViewDevice adapters (Left / Right / SBS) copy or demosaic off that
+// latch into their own virtual cameras.
 //
 // Two devices never share a handle, and N views fan out read-only off the latch,
 // so a single PS4 can be ONE switchable camera or TWO simultaneous cameras
 // (split mode) with no extra USB cost. The engine streams only while >=1 view is
-// awake (StartStreaming/StopStreaming refcount) and fully releases USB when the
-// last view sleeps — preserving the project's zero-idle-CPU discipline.
+// awake (StartStreaming/StopStreaming refcount) and cancels its iso ring when the
+// last view sleeps — preserving the project's zero-idle-CPU discipline. The USB
+// handle itself stays open across sleep; see StartStreaming for why.
 //
-// Why per-eye planes and not one combined frame: the OV580 TIME-MULTIPLEXES the
-// two eyes across frames (any given frame populates one 1280-px band and fills
-// the other with a constant 0x800a "null"). The reassembler accumulates the most
-// recent NON-null rows per eye, so both planes stay current even though the
-// hardware only paints one at a time. Heavy work (demosaic) lives in the view,
-// off this engine's iso event thread, which stays reassembly-only at ~275 MB/s.
+// Why per-eye planes and not one combined frame: in RAW mode the OV580
+// TIME-MULTIPLEXES the two eyes across frames (any given frame populates one
+// 1280-px band and fills the other with a constant 0x800a "null"). The
+// reassembler accumulates the most recent NON-null rows per eye, so both planes
+// stay current even though the hardware only paints one at a time. Heavy work
+// (demosaic) lives in the view, off this engine's iso event thread, which stays
+// reassembly-only at ~275 MB/s.
 //
 #include "Ps4MicDsp.h"
 
@@ -48,11 +51,11 @@ constexpr uint32_t kEyeBayerBytes = kEyeWidth * kEyeHeight * 2;   // 2,048,000
 // [32 B header][64 B audio][left eyeW*2][right eyeW*2][trailer] — so the whole
 // publish path generalises through this struct instead of constants.
 //
-// All nine entries are HARDWARE-VERIFIED: each was committed and streamed, and
-// the delivered bytes per frame matched the requested geometry. The OV580 is
-// NOT limited to 60 fps — that reading comes from a probe that sends the
-// 1280x800 dwMaxVideoFrameSize with every
-// frame index, which the legacy firmware ignored and the final firmware refused.
+// All nine entries are HARDWARE-VERIFIED: each commits and streams, and the
+// delivered bytes per frame match the requested geometry. The OV580 is NOT
+// limited to 60 fps; a probe that sends the 1280x800 dwMaxVideoFrameSize with
+// every frame index only makes it look that way, because the final firmware
+// refuses such a commit.
 struct IspGeometry
 {
     uint8_t  frameIndex;   // UVC bFrameIndex
@@ -90,8 +93,8 @@ public:
 
     // Close + drop any cached sources whose port path is NOT in `present`. Called
     // by the registry on a device-change so a physically-removed camera's open USB
-    // handle is released (and re-uploaded firmware on next plug). Sources for still-
-    // present cameras are kept OPEN across sleep/wake — see the lifecycle note below.
+    // handle is released (and firmware re-uploaded on next plug). Sources for
+    // still-present cameras are kept OPEN across sleep/wake — see StartStreaming.
     static void RetireAbsent(const std::vector<std::string>& present);
 
     ~Ps4CaptureSource();
@@ -109,14 +112,15 @@ public:
 
     // Select a delivered ISP mode by per-eye geometry. Called from a view's
     // Init() BEFORE Start(). Re-commits the UVC stream if the device is already
-    // open (stopping the iso ring around the change, which is exactly what the
-    // hardware mode matrix did ten times in a row without a wedge). Returns
-    // false only if the geometry is not one the hardware delivers.
+    // open, stopping the iso ring around the change (repeated mode switches this
+    // way run without a wedge or replug). Returns false if the geometry is not
+    // one the hardware delivers, or if the re-commit failed. `onlyIfIdle` makes
+    // it a no-op while any view is awake (a split pair's non-owning half).
     //
     // ONE geometry per physical camera: a split pair shares this engine, so the
     // owning (home/Left) view decides and the other half adopts — which is why
     // Ps4ViewDevice reports ActualMode() rather than what it asked for.
-    bool RequestGeometry(uint32_t eyeW, uint32_t eyeH, uint32_t fps);
+    bool RequestGeometry(uint32_t eyeW, uint32_t eyeH, uint32_t fps, bool onlyIfIdle = false);
 
     // The geometry currently committed (never null-equivalent; defaults to
     // 1280x800@60 before the first request).
@@ -129,22 +133,20 @@ public:
     // the source's lifetime, so views can read it without locking.
     bool UsesIsp() const { return _useIsp; }
 
-    // Push camera controls (ISP mode). Maps app Settings to UVC controls:
-    // autoExposure=true -> CT_AE_MODE auto; false -> shutter-priority + manual
-    // CT_EXPOSURE_ABS, with PU_GAIN; brightness -> PU_BRIGHTNESS. Values are app
-    // units: gain 0-63, brightness/contrast/wbTemp 0-255. All four map onto live
-    // ISP controls (PU_GAIN, PU_BRIGHTNESS, PU_CONTRAST, PU_WB_TEMPERATURE +
-    // its auto flag), all hardware-measured.
+    // Push camera controls (ISP mode). Each field maps onto a live UVC
+    // Processing Unit control (PU_GAIN, PU_BRIGHTNESS, PU_CONTRAST,
+    // PU_SATURATION, PU_SHARPNESS, PU_POWER_LINE_FREQUENCY, PU_WB_TEMPERATURE +
+    // its auto flag), all hardware-measured. Values are app units: gain 0-63,
+    // the rest 0-255.
     //
-    // `autoExposure` and `exposure` are IGNORED: the OV580's shutter is
-    // permanently automatic on every AE mode it accepts. For a dark scene (PS
-    // Move / light-gun tracking) turn GAIN and brightness down instead.
+    // There is no exposure field: the OV580's shutter is permanently automatic
+    // on every AE mode it accepts. For a dark scene (PS Move / light-gun
+    // tracking) turn GAIN and brightness down instead.
     //
     // Stored and applied at bring-up; applied live when already streaming. Safe to
     // call from the capture-controller thread. No-op in RAW mode.
-    // Grouped rather than passed positionally: this list has grown twice, and
-    // both times a control was silently dropped on the way through because the
-    // argument order was edited in one place and not another.
+    // A struct rather than positional arguments, so adding a control cannot
+    // silently drop another through a mismatched argument order.
     struct IspControls
     {
         uint32_t gain          = 20;    // app units 0..63
@@ -160,9 +162,9 @@ public:
 
     // Microphone array gain, 0..100 %. NOT a live control: writing it needs the
     // stream stopped, so this stops, writes and brings the stream back, and
-    // no-ops when the value has not changed.
+    // no-ops when the value has not changed. A write that fails keeps the
+    // previous gain; false means the stream could not be restored afterwards.
     bool SetMicGain(uint32_t pct);
-    uint32_t MicGain() const { return _micGainPct; }
 
     // ---- microphone ------------------------------------------------------
     // The 4-mic array is NOT a USB-audio function: 64 bytes of AK5703 output ride
@@ -182,8 +184,8 @@ public:
     // Audio discarded after each stream start while the ADC settles: it ramps
     // -20, -28, -39, -48 dBFS over ~400 ms before reaching the room's level, and
     // publishing that is a thump plus a meter pinned to full scale. Expressed as
-    // a TIME, not a row count -- rows/second is mode-dependent, so the old fixed
-    // 24000 rows meant 0.49 s at 1280x800@60 but 2.0 s at 320x192@60.
+    // a TIME, not a row count, because rows/second is mode-dependent (StartIso
+    // converts it for the committed geometry).
     static const uint32_t kMicSettleMs   = 500;
     // A dropped VIDEO frame takes a frame of audio with it. Concealing more than
     // a few in a row would be inventing audio, so past this we let the gap
@@ -224,11 +226,16 @@ public:
     // seq (== lastSeq if it timed out with nothing new). Multi-reader safe.
     uint64_t WaitNewer(uint64_t lastSeq, uint32_t timeoutMs);
 
-    // Copy the latest Bayer plane(s) into caller buffers (each sized
+    // Copy the latest eye plane(s) into caller buffers (each sized
     // kEyeBayerBytes; pass nullptr to skip an eye). Non-blocking. Returns the
-    // seq of the snapshot, or 0 if no frame has been assembled yet.
-    uint64_t SnapshotPlanes(uint8_t* leftDst, uint8_t* rightDst);
-
+    // seq of the snapshot, or 0 if no frame has been assembled yet. `metadata`
+    // receives the geometry the copied pixels were published with.
+    struct FrameSnapshot
+    {
+        IspGeometry geometry{};
+        uint64_t sequence = 0, generation = 0;
+    };
+    uint64_t SnapshotPlanes(uint8_t* leftDst, uint8_t* rightDst, FrameSnapshot* metadata = nullptr);
 
 private:
     explicit Ps4CaptureSource(std::string portPath);
@@ -240,13 +247,22 @@ private:
     void StopIso();          // cancel the iso ring (per sleep); KEEPS the handle open
     void CloseDevice();      // full teardown: stop iso + release + close (removal/exit)
 
-    bool EnsureRunningDevice();   // firmware upload if in boot state; returns 058A handle ready
+    bool EnsureRunningDevice();   // firmware upload if in boot state; leaves _h on the streaming identity
     bool BringUpIsp();            // UVC probe/commit (YUYV) + auto-exposure (ISP mode)
-    void ApplyControls();         // send the stored ISP controls to _h (holds _stateMutex caller)
+    // Re-commit the stream on the OPEN handle: alt 0, optional mic-gain write,
+    // alt 1, probe/commit, and resubmit the ring if it was streaming. Caller has
+    // already stopped the ring.
+    bool Recommit(bool writeMicGain, bool restartIso);
+    // A re-commit failed: put the previous state back on the same handle, and
+    // close only if even that fails or the device is gone. Reopening is what
+    // degrades the OV580's session, so it is the last resort, not the first.
+    // Returns true when the previous state is running again.
+    bool RecoverAfterFailedCommit(bool restartIso);
+    void ApplyControls();         // send the stored ISP controls to _h (caller holds _stateMutex)
     bool Ak5703BringUp();         // power up + configure the mic ADC (once per session,
                                   // while interface 1 is still on alt 0 -- see the call site)
     void PublishAudio(const uint8_t* frame, uint32_t pts, bool ptsValid);
-    void ResetMicDsp();                        // rebuild the filter for _geom, clear state
+    void ResetMicDsp();           // rebuild the filter for _geom, clear state
     void SubmitIsoRing();
     void FreeTransfers();
 
@@ -257,8 +273,8 @@ private:
     void OnPayload(const uint8_t* d, int len);
     void ExtractFrames();    // cut synced frames out of _stream  (RAW mode)
     bool ResyncLocked();     // (re)find row phase + frame boundary in _stream
-    // Reassemble one clean frame's non-null eye bands (at _stream[start]) into
-    // the published planes (RAW mode).
+    // Reassemble one clean frame's non-null eye bands into the published planes
+    // (RAW mode).
     void ReassembleAndPublish(const uint8_t* frame);
 
     // ISP-mode depacketiser: FID-delimited full YUYV frames (one image between FID
@@ -267,7 +283,6 @@ private:
     void PublishIspFrame(const uint8_t* frame, uint32_t pts, bool ptsValid);
 
     const std::string _portPath;
-    std::string       _key;        // map key (== _portPath) for self-erase
 
     // ---- streaming state (guarded by _stateMutex) ----
     mutable std::mutex    _stateMutex;   // mutable: Geometry() is a const accessor
@@ -275,11 +290,12 @@ private:
     bool                  _streaming  = false;   // iso ring submitted
     bool                  _open       = false;   // device opened + set up (handle held)
     bool                  _ctxAcquired = false;
+    std::atomic<bool>     _deviceLost{false};
     const bool            _useIsp;       // YUYV ISP (default) vs legacy RAW Bayer
     libusb_device_handle* _h = nullptr;
 
-    // ISP camera controls (guarded by _ctrlMutex). Cached UVC entity ids are
-    // resolved once at bring-up. Defaults match the app Settings defaults.
+    // ISP camera controls (guarded by _ctrlMutex). Defaults match the app
+    // Settings defaults. Lock order: _stateMutex before _ctrlMutex.
     std::mutex _ctrlMutex;
     IspControls _ctrl;
 
@@ -287,15 +303,6 @@ private:
     // stopped, so the ISO EVENT THREAD never sees it change mid-frame (that is
     // what makes the unlocked reads in PublishIspFrame / PublishAudio safe).
     IspGeometry _geom{};
-
-    // Per-eye plane size, republished whenever _geom changes.
-    //
-    // SnapshotPlanes runs on a view's capture thread, which the iso-ring-stopped
-    // argument above does not cover. It must NOT take _stateMutex to read _geom:
-    // StopIso holds _stateMutex while waiting for the ring to drain, and that
-    // drain runs through PublishIspFrame, which takes _latchMutex -- so blocking
-    // on _stateMutex while holding _latchMutex deadlocks teardown.
-    std::atomic<uint32_t> _eyeBytes{ kEyeBayerBytes };
 
     // ---- microphone ring -------------------------------------------------
     // One second of 4ch/48 kHz int16 (384 KB). Written only by the iso event
@@ -311,8 +318,8 @@ private:
     uint32_t             _micSettleRows = 0;   // iso thread only; set by StartIso
     // Output-rate estimator, iso thread only apart from the published atomic.
     // A SLIDING window, not a running average since stream start: a cumulative
-    // one never recovers from a capture interruption, and read -374 ppm against
-    // a true +487 for minutes afterwards. Restarted whenever the conceal count
+    // one never recovers from a capture interruption (it reads -374 ppm against
+    // a true +487 for minutes afterwards). Restarted whenever the conceal count
     // moves (audio was lost, so the count is not a rate any more) or the window
     // reaches 20 s.
     long long            _micRateT0 = 0;       // QPC at the window start
@@ -327,32 +334,35 @@ private:
     std::vector<int16_t> _micFrameBuf;   // one frame of output, iso thread only
     // Drop detection from the UVC presentation timestamp rather than the host
     // clock. The 12-byte iso header carries PTS and SCR (bmHeaderInfo bits 2
-    // and 3, both set on this firmware). The host-clock rule is honest at 60 and
-    // 120 fps but fires on jitter at 240, where the frame period is 4.2 ms --
-    // it concealed twice against one real gap, fabricating 200 samples.
+    // and 3, both set on this firmware). A host-clock rule is honest at 60 and
+    // 120 fps but fires on jitter at 240, where the frame period is 4.2 ms, and
+    // conceals gaps that never happened.
     uint32_t             _ispFramePts = 0;         // iso thread only
     bool                 _ispFramePtsValid = false;
     uint32_t             _micLastPts = 0;
     bool                 _micLastPtsValid = false;
     uint32_t             _micPtsPerFrame = 0;      // running minimum = true period
     std::atomic<uint32_t> _micDropouts{0};     // concealed gaps this session
-    uint8_t  MicGainReg() const;
-    void     WriteMicGain();                   // caller holds _stateMutex, alt 0
     std::atomic<uint32_t> _micLevel[kMicChannels] = {};   // RMS * 10000, per channel
-    uint8_t    _ctEntity = 0;     // Camera Terminal (AE mode / exposure)
-    uint8_t    _puEntity = 0;     // Processing Unit  (gain / brightness)
+    uint8_t  MicGainReg() const;
+    bool     WriteMicGain();                   // caller holds _stateMutex, alt 0
+
+    // UVC entity ids, resolved from the descriptors at each bring-up.
+    uint8_t    _ctEntity = 0;     // Camera Terminal (AE mode)
+    uint8_t    _puEntity = 0;     // Processing Unit (gain / brightness / ...)
 
     std::vector<libusb_transfer*>     _xfers;
     std::vector<std::vector<uint8_t>> _xferBufs;
     std::atomic<bool>                 _cancelling{ false };
     std::atomic<int>                  _xfersInFlight{ 0 };
 
-    // ---- depacketiser state (touched ONLY on the iso event thread) ----
-    // Rolling header-stripped video stream + frame sync. Every clean row begins
-    // with [validMask][0x88][0x88]; a frame is exactly kFrameRows rows; the
-    // frame-boundary row has validMask==0x00. We lock onto a frame start (row
-    // phase via the 0x88 0x88 signature + the boundary marker) then cut fixed
-    // frames, re-syncing if the expected signature ever drifts.
+    // ---- depacketiser state (iso event thread, or a caller holding
+    // _stateMutex with the ring stopped) ----
+    // Rolling header-stripped video stream + frame sync. RAW mode: a frame is
+    // exactly kFrameRows rows and the frame-boundary row has validMask==0x00;
+    // ResyncLocked locks onto that boundary, then fixed frames are cut,
+    // re-syncing if a frame's last row is ever not the boundary. ISP mode: the
+    // UVC FID bit delimits frames.
     std::vector<uint8_t> _stream;          // rolling stripped payload
     bool                 _synced = false;
     size_t               _frameStart = 0;  // index in _stream of the current frame's row 0
@@ -364,6 +374,9 @@ private:
     std::vector<uint8_t>    _pubLeft;    // kEyeBayerBytes
     std::vector<uint8_t>    _pubRight;   // kEyeBayerBytes
     uint64_t                _seq = 0;    // ++ per published frame; 0 = none yet
+    FrameSnapshot           _latched{};
+    uint64_t                _generation = 0;
+    bool                    _latchValid = false;
 };
 
 } // namespace ps4

@@ -10,7 +10,6 @@
 #include "FrameBusPreviewSource.h"
 #include "../common/FrameBus.h"
 #include "../common/Settings.h"
-#include "../res/resource.h"
 
 namespace
 {
@@ -73,8 +72,8 @@ void CameraPreview::Attach(HWND parent, int ctrlId, HINSTANCE /*inst*/)
     if (!_wnd)
         return;
 
-    // Capture the dialog-template cell before any subclassing/resize so
-    // ResizeToAspect always anchors here (no drift across format changes).
+    // Seed the cell from the control's rect before any subclassing/resize so
+    // ResizeToAspect anchors there until the layout calls SetCell.
     GetWindowRect(_wnd, &_cell);
     MapWindowPoints(nullptr, parent, reinterpret_cast<LPPOINT>(&_cell), 2);
 
@@ -95,7 +94,10 @@ void CameraPreview::Attach(HWND parent, int ctrlId, HINSTANCE /*inst*/)
 
 void CameraPreview::Detach()
 {
-    const int cam = _cameraIndex.load(std::memory_order_relaxed);
+    // Forget the camera as well as releasing its hold, so a second Detach (the
+    // destructor's) does not clear the hold again, and a later SetCamera on the
+    // same index is not mistaken for a no-op re-target.
+    const int cam = _cameraIndex.exchange(-1, std::memory_order_relaxed);
     if (_controllers && cam >= 0)
         (_controllers + cam)->SetPreviewHold(false);
 
@@ -127,7 +129,9 @@ void CameraPreview::StopWorker()
         SetEvent(_stopEvent);
     if (_thread)
     {
-        WaitForSingleObject(_thread, 2000);
+        // The worker only uses bounded waits and posted UI messages. Its state
+        // and DIB must stay alive until it has actually returned.
+        WaitForSingleObject(_thread, INFINITE);
         CloseHandle(_thread);
         _thread = nullptr;
     }
@@ -167,6 +171,7 @@ bool CameraPreview::RecreateDib(int width, int height)
     if (_dibDc) { SelectObject(_dibDc, _dibOld); DeleteDC(_dibDc); _dibDc = nullptr; _dibOld = nullptr; }
     if (_dib)   { DeleteObject(_dib); _dib = nullptr; }
     _dibBits = nullptr;
+    _dibW = _dibH = 0;
 
     BITMAPINFO bi{};
     bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
@@ -177,20 +182,24 @@ bool CameraPreview::RecreateDib(int width, int height)
     bi.bmiHeader.biCompression = BI_RGB;
 
     _dib = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &_dibBits, nullptr, 0);
-    if (_dib)
+    if (_dib && _dibBits)
     {
         _dibDc  = CreateCompatibleDC(nullptr);
         _dibOld = static_cast<HBITMAP>(SelectObject(_dibDc, _dib));
-        if (_dibBits)
+        if (_dibDc && _dibOld && _dibOld != HGDI_ERROR)
+        {
             std::memset(_dibBits, 0, static_cast<size_t>(width) * height * 4);
-        // Only stamp the new dims on a fully-built buffer so a transient
-        // CreateDIBSection failure is retried on the next worker pass.
-        _dibW = width;
-        _dibH = height;
+            // Only stamp the new dims on a fully-built buffer so a transient
+            // allocation failure is retried on the next worker pass.
+            _dibW = width;
+            _dibH = height;
+        }
     }
-    else
+    if (_dibW == 0)   // any partial allocation is released, not kept
     {
-        _dibW = _dibH = 0;
+        if (_dibDc) DeleteDC(_dibDc);
+        if (_dib) DeleteObject(_dib);
+        _dibDc = nullptr; _dibOld = nullptr; _dib = nullptr; _dibBits = nullptr;
     }
 
     ReleaseSRWLockExclusive(&_dibLock);
@@ -259,10 +268,9 @@ void CameraPreview::ResizeToAspect()
 
     // Fill the full cell width and derive the height from the true source
     // aspect, so the preview is a gap-free srcW:srcH rectangle — no letterbox
-    // bars, no distortion. The dialog cell is sized ~4:3 (see app.rc) so the
-    // height lands just inside it; any spare pixels sit below the image as plain
-    // dialog background, never as bars framing it. If the derived height would
-    // overflow a very short cell, clamp to the height and narrow the width.
+    // bars, no distortion. Any spare pixels sit below the image as plain dialog
+    // background, never as bars framing it. If the derived height would
+    // overflow a short cell, clamp to the height and narrow the width.
     int w = cellW;
     int h = (cellW * srcH) / srcW;
     if (h > cellH)
@@ -299,6 +307,12 @@ bool CameraPreview::EnsureBackBuffer(HDC ref, int w, int h)
         return false;
     }
     _backOld = static_cast<HBITMAP>(SelectObject(_backDc, _backBmp));
+    if (!_backOld || _backOld == HGDI_ERROR)
+    {
+        DeleteDC(_backDc); DeleteObject(_backBmp);
+        _backDc = nullptr; _backBmp = nullptr; _backOld = nullptr;
+        return false;
+    }
     _backW = w;
     _backH = h;
     return true;
@@ -318,8 +332,8 @@ void CameraPreview::Paint(HDC hdc, int w, int h)
 
     // Compose the whole frame off-screen, then blit it to the window in one
     // shot. Drawing the scaled frame and the "in use" badge straight to the
-    // window DC ~60x/sec made the badge (overdrawn by every new frame and then
-    // redrawn) flicker, and pushed a full StretchBlt to the screen each frame.
+    // window DC ~60x/sec makes the badge (overdrawn by every new frame and then
+    // redrawn) flicker, and pushes a full StretchBlt to the screen each frame.
     // A single BitBlt of a fully-composed buffer updates the screen atomically:
     // no flicker, and the only screen-bound work per frame is one BitBlt.
     const HDC dc = EnsureBackBuffer(hdc, w, h) ? _backDc : hdc;
@@ -332,11 +346,11 @@ void CameraPreview::Paint(HDC hdc, int w, int h)
     const bool haveFrame = _dibDc && _dibW > 0 && _dibH > 0;
     if (haveFrame)
     {
-        // High-quality interpolated scale. The preview box is smaller than the
-        // 640x480 source, so this is a shrink; GDI's default BLACKONWHITE mode
+        // High-quality interpolated scale. The preview box is usually smaller
+        // than the source, so this is a shrink; GDI's default BLACKONWHITE mode
         // boolean-ANDs the eliminated pixels when shrinking a colour image,
-        // darkening it and shredding fine detail — which made the preview look
-        // far worse than the real stream (most visible on the sharp PS3 Eye).
+        // darkening it and shredding fine detail — making the preview look far
+        // worse than the real stream (most visible on the sharp PS3 Eye).
         // HALFTONE averages the source pixels for a faithful reproduction; it
         // requires the brush origin to be reset to avoid mis-aligned dithering.
         SetStretchBltMode(dc, HALFTONE);
@@ -449,8 +463,9 @@ DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
             }
         }
 
-        // Block until a new frame *might* be available. Bounded so we still
-        // notice _running flips and cameraIndex changes quickly.
+        // Wait until a new frame *might* be available (a short poll; see
+        // FrameBusPreviewSource::WaitFrame). Bounded so we still notice
+        // _running flips and cameraIndex changes quickly.
         self->_source->WaitFrame(150);
         if (!self->_running.load(std::memory_order_relaxed))
             break;
@@ -466,8 +481,9 @@ DWORD WINAPI CameraPreview::WorkerProc(LPVOID selfp)
             lastInUseCheck = nowTick;
             const uint32_t idleMs = (self->_controllers + cam)
                                         ->ActiveSettings().idleTimeoutMs;
-            self->_inUse.store(self->_source->IsCameraInUse(idleMs),
-                               std::memory_order_relaxed);
+            const bool inUse = self->_source->IsCameraInUse(idleMs);
+            if (self->_inUse.exchange(inUse, std::memory_order_relaxed) != inUse)
+                InvalidateRect(self->_wnd, nullptr, FALSE);
         }
 
         const uint32_t dstBytes = framebus::Yuy2Bytes(w, h);

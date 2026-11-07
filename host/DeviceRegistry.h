@@ -33,15 +33,27 @@ struct Ps4SlotInfo
 };
 Ps4SlotInfo QueryPs4Slot(int slot);
 
+inline bool OwnsMicrophone(const DeviceProfile* profile, const Ps4SlotInfo& info)
+{
+    return profile && (profile->controlMask & CTRL_MICARRAY) != 0 &&
+           !(info.isPs4 && info.split && info.view == Ps4ViewKind::Right);
+}
+
+inline bool SamePs4DeviceRole(const Ps4SlotInfo& a, const Ps4SlotInfo& b)
+{
+    return a.isPs4 && b.isPs4 && a.portPath == b.portPath &&
+        (a.split && a.view == Ps4ViewKind::Right) == (b.split && b.view == Ps4ViewKind::Right);
+}
+
 // Stable FNV-1a/32 hash of a camera's USB port path, used to tag a persisted
 // ps4Split with the camera that set it (Settings::ps4SplitOwner). A persisted
 // split is honored only when this hash matches the camera now in the slot, so a
 // DIFFERENT camera that later reuses the same slot index cannot inherit a stale
 // "split" flag and silently claim a second slot. Never returns 0: the stored value
-// 0 is reserved as the legacy wildcard owner (split saved before owner tagging, or
-// with the camera briefly absent), which the registry honors for any camera. Must
-// be deterministic across processes/builds, so std::hash (which may be randomized)
-// is deliberately not used.
+// 0 is reserved as the wildcard owner (a split stored without an owner tag, or
+// saved with the camera briefly absent), which the registry honors for any camera.
+// Must be deterministic across processes/builds, so std::hash (which may be
+// randomized) is deliberately not used.
 inline uint32_t Ps4OwnerHash(const std::string& portPath)
 {
     uint32_t h = 2166136261u;
@@ -77,7 +89,7 @@ void SlotDisplayName(int slot, wchar_t* buf, size_t cap);
 void PublishColdBlock(framebus::Writer& bus, int slot);
 
 // Build the ICameraDevice for the camera in `slot`, or nullptr if empty.
-std::unique_ptr<ICameraDevice> Acquire(int slot);
+[[nodiscard]] std::unique_ptr<ICameraDevice> Acquire(int slot);
 
 // Force a re-enumeration: drops unplugged devices and repairs replugged slots.
 void Rescan();

@@ -20,7 +20,7 @@ bool Ps3EyeDevice::Init(const VideoMode& mode)
         if (!_buf)
             return false;
     }
-    // Native fused Bayer->YUY2 (no RGB intermediate), exactly as before.
+    // Native fused Bayer->YUY2 (no RGB intermediate).
     if (!_eye->init(mode.width, mode.height, static_cast<uint16_t>(mode.fps),
                     PS3EYECam::EOutputFormat::YUY2))
     {
@@ -61,8 +61,7 @@ bool Ps3EyeDevice::AcquireFrame(AcquiredFrame& out, uint32_t timeoutMs, bool /*w
     return true;
 }
 
-// Push every sensor-level setting (order-safe live or pre-start). This is the
-// former CaptureController::ApplySensorSettings, moved to where it belongs.
+// Push every sensor-level setting (order-safe live or pre-start).
 void Ps3EyeDevice::ApplySettings(const Settings& s)
 {
     if (!_eye)

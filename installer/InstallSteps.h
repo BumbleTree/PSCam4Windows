@@ -3,10 +3,10 @@
 // The install/uninstall step engine. Installation is a sequence of Step
 // objects, each pairing a Run action with a best-effort Undo. On any failure
 // (or user cancel between steps) the engine unwinds every completed step in
-// reverse, so a half-finished install never leaves certificates, drivers, or
-// COM registrations behind. Uninstall runs the same machinery linearly with
-// continue-on-error semantics (a stubborn driver should not stop the rest of
-// the cleanup).
+// reverse, including partial execution of the failed step. Recovery failures
+// are reported and recoverable file backups are retained. Uninstall runs
+// linearly with continue-on-error semantics (a stubborn driver should not stop
+// the rest of the cleanup).
 //
 #include <windows.h>
 
@@ -50,27 +50,11 @@ struct DriverDef
 {
     const wchar_t* displayName;   // "PS3 Eye"
     const wchar_t* infLeaf;       // "usb_device.inf"
-    const wchar_t* cerLeaf;       // "usb_device.cer"
     const wchar_t* arpOemValue;   // "PnpOem_usb_device"
-    WORD           infRes;
-    WORD           catRes;
-    WORD           cerRes;
+    WORD           cerRes;        // embedded signing certificate
 };
 extern const DriverDef kDrivers[3];
 bool DriverSelected(const InstallOptions& opts, int index);
-
-// Raw snapshot of the Add/Remove Programs key for upgrade-safe undo.
-struct ArpSnapshot
-{
-    struct Value
-    {
-        std::wstring      name;
-        DWORD             type = 0;
-        std::vector<BYTE> data;
-    };
-    bool               existed = false;
-    std::vector<Value> values;
-};
 
 // Everything the steps read and record. One instance lives for the whole
 // engine run; Undo implementations consume the state their Run recorded.
@@ -80,7 +64,7 @@ struct SetupContext
     std::wstring   installDir;      // ops::InstallDir()
     std::wstring   setupExePath;    // running module (may be the temp relaunch copy)
     std::wstring   sourceDir;       // dir of the ORIGINAL setup exe (firmware.bin lookup)
-    InstallState   arpState;        // pre-read ARP state (uninstall: oem inf names)
+    InstallState   arpState;        // ARP state read at startup (certificate ownership)
     Logger*        log = nullptr;
     std::atomic<bool>* cancel = nullptr;
     HWND           notifyWnd = nullptr;
@@ -89,6 +73,7 @@ struct SetupContext
     bool rebootRequired = false;
     bool stagedDriver[3] = {};      // pnputil 259: staged, binds on plug-in
     int  warnings = 0;              // uninstall: non-fatal problems
+    bool rollbackIncomplete = false;
 
     // recorded state for undo
     std::wstring prevTrayPath;
@@ -98,12 +83,10 @@ struct SetupContext
     std::vector<std::pair<std::wstring, std::wstring>> backups;   // original -> backup copy
     std::wstring backupDir;
     std::vector<CertRecord> certsAdded;
-    bool driverWasPreexisting[3] = {};
     std::wstring oemInfName[3];
-    bool fwCopied[2] = {};                        // firmware.bin, startup.bin
+    std::vector<std::wstring> newDriverPackages[3];
     bool settingsKeyExisted = false;
     bool autostartTaskExisted = false;
-    ArpSnapshot arpSnapshot;
 };
 
 class Step
@@ -122,7 +105,7 @@ namespace engine
 std::vector<std::unique_ptr<Step>> BuildInstallSteps();
 std::vector<std::unique_ptr<Step>> BuildUninstallSteps();
 
-// Install semantics: stop at the first failure and unwind completed steps.
+// Install semantics: stop at the first failure and unwind attempted steps.
 EngineResult Run(std::vector<std::unique_ptr<Step>>& steps, SetupContext& ctx);
 // Uninstall semantics: run everything, count failures as ctx.warnings.
 EngineResult RunLinear(std::vector<std::unique_ptr<Step>>& steps, SetupContext& ctx);

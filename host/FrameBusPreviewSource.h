@@ -2,7 +2,7 @@
 //
 // FrameBusPreviewSource — the FrameBus-backed implementation of
 // ICameraPreviewSource. Transport-agnostic: it reads whatever the host is
-// publishing (PS3 Eye, EyeToy, ...) since every device feeds the same FrameBus.
+// publishing (PS3 Eye, EyeToy, PS4) since every device feeds the same FrameBus.
 //
 // Composes:
 //   * framebus::Reader  (FILE_MAP_READ seqlock consumer; multi-reader safe,
@@ -12,8 +12,8 @@
 //
 // Lives entirely on the preview worker thread; no shared mutable state.
 //
-// INVARIANT: this source MUST poll the seqlock (Sleep-based
-// WaitFrame), never wait on the ".FrameReady" event. That event is auto-reset,
+// INVARIANT: this source MUST poll the seqlock (Sleep-based WaitFrame), never
+// wait on the ".FrameReady" event. That event is auto-reset,
 // so SetEvent releases exactly one waiter; the single permitted waiter is the
 // DLL's DeliverSample. A preview that waited on it would steal wakeups and
 // starve the virtual camera. Do not "optimize" WaitFrame into an event wait.
@@ -35,4 +35,5 @@ public:
 private:
     framebus::Reader _reader;
     int _cameraIndex = 0;
+    uint32_t _width = 0, _height = 0;
 };

@@ -21,16 +21,15 @@
 // every other reader (preview, capability probe) must poll the seqlock.
 //
 // ---------------------------------------------------------------------------
-// v4 layout (one section per slot, sized PER-SLOT from its device's largest mode):
+// Layout (kVersion 4; one section per slot, its YUY2 region sized by the writer):
 //   [   0 ..  63] HotHeader  — magic, version, payloadFormat, w, h, fps, jpegLen,
 //                              frameRegionBytes, seq, frameId, qpc   (everything
 //                              TryReadNewer touches; one cache line, isolated from
 //                              cold capability reads)
 //   [  64 ..4095] ColdBlock  — transportClass, defaultFormat, modeCount, modeTable[]
 //                              (queried once at wake; never on the per-frame path)
-//   [4096 ..+YUY2] YUY2 pixels                 (frameRegionBytes — per slot; the
-//                              PS3 Eye/EyeToy reserve the legacy 640x480 size, a PS4
-//                              slot reserves up to its 1280x800/eye or combined frame)
+//   [4096 ..+YUY2] YUY2 pixels                 (frameRegionBytes — never less than
+//                              640x480 YUY2, at most kAbsMaxFrameBytes)
 //   [ then ..+JPEG] JPEG sidecar               (jpegCapacity; filled only when an
 //                              MJPEG client is active — PS3/PS4 machines never touch it.
 //                              The sidecar begins at kDataOffset + frameRegionBytes.)
@@ -46,7 +45,7 @@
 namespace framebus {
 
 constexpr uint32_t kMagic      = 0x50533345;  // 'PS3E'
-constexpr uint32_t kVersion    = 4;           // v4: capability-sized per-slot sections
+constexpr uint32_t kVersion    = 4;           // bump on any layout change
 
 // payloadFormat values. YUY2 is canonical: the host always publishes YUY2 (the
 // PS3 Eye's native output, and the EyeToy's decoded output), so the no-poll
@@ -72,19 +71,17 @@ enum FormatMaskBits : uint32_t
 constexpr uint32_t kMaxWidth      = 640;      // PS3 Eye / EyeToy sensor maximum
 constexpr uint32_t kMaxHeight     = 480;
 constexpr uint32_t kDataOffset    = 4096;     // header page (HotHeader + ColdBlock), then pixels
-// Legacy small-mode frame size (PS3 Eye / EyeToy). Their sections still reserve
-// exactly this, so a PS3-only machine is unchanged. Used directly only by
-// device buffers that are genuinely bounded to <=640x480 (the PS3 capture buffer).
+// The 640x480 frame size: the smallest YUY2 region a section may reserve, and
+// the size of device buffers genuinely bounded to <=640x480 (the PS3 capture
+// buffer).
 constexpr uint32_t kMaxFrameBytes = kMaxWidth * kMaxHeight * 2;  // 614400 YUY2
-// v4: sections are sized PER-SLOT from the occupying device's largest mode
-// (Writer::Create takes frameRegionBytes). This is the absolute ceiling any slot
-// may reserve for its YUY2 region — the PS4 camera's raw combined stereo frame
-// (3448x808) — used as a sanity clamp and as the size of host-side staging
-// buffers that must fit any slot.
+// The absolute ceiling any slot may reserve for its YUY2 region — the PS4
+// camera's raw combined stereo frame (3448x808) — used as a sanity clamp and as
+// the size of host-side staging buffers that must fit any slot.
 constexpr uint32_t kAbsMaxFrameBytes = 3448u * 808u * 2u;   // 5,571,968
 constexpr uint32_t kMaxJpegBytes  = 262144;   // 256 KiB JFIF sidecar (EyeToy MJPEG)
-// NB: sections are sized PER-SLOT (Writer::Create computes kDataOffset +
-// frameRegionBytes + jpegCapacity); there is no single fixed section size.
+// There is no single fixed section size: Writer::Create sizes each one as
+// kDataOffset + frameRegionBytes + jpegCapacity.
 
 // ColdBlock lives at this offset, on its own cache line away from the seqlock
 // fields so capability reads never false-share with per-frame publishes.
@@ -116,25 +113,38 @@ struct ColdMode
     uint32_t width;
     uint32_t height;
     uint32_t fps;
-    uint32_t formatMask;     // FMT_* bits the device may advertise for this mode
+    uint32_t formatMask;     // FormatMaskBits the device may advertise for this mode
 };
 
-// Static capability block for the slot's device. Written once by the host
-// before the virtual camera is registered, then read by the
-// DLL at activation to build its media-type list. transportClass/formatMask are
-// stored as raw uint32_t so this header has no dependency on host/ICameraDevice.h.
+// Capability block for the slot's device. Published before registration and
+// updated on slot/view changes; seq protects every snapshot. transportClass and
+// formatMask are stored as raw uint32_t so this header has no dependency on
+// host/ICameraDevice.h.
 struct ColdBlock
 {
     uint32_t transportClass; // TransportClass of the slot's device
-    uint32_t defaultFormat;  // FMT_* the DLL should default to (NV12 PS3, YUY2 EyeToy)
+    uint32_t defaultFormat;  // FormatMaskBits value the DLL defaults to (NV12 PS3 Eye, else YUY2)
     uint32_t modeCount;      // valid entries in modes[]
-    uint32_t pad0;
+    volatile LONG seq;       // capability seqlock, independent of frame publication
     ColdMode modes[kMaxModes];
 };
 #pragma pack(pop)
 
 static_assert(sizeof(HotHeader) <= kColdOffset, "hot header must stay within one cache line");
 static_assert(kColdOffset + sizeof(ColdBlock) <= kDataOffset, "cold block must fit in the header page");
+
+inline bool ValidDimensions(uint32_t w, uint32_t h, uint32_t capacity)
+{
+    return w > 0 && h > 0 && w <= 4096 && h <= 4096 &&
+           (w & 1u) == 0 && (h & 1u) == 0 &&
+           static_cast<uint64_t>(w) * h * 2 <= capacity;
+}
+
+inline bool ValidRate(uint32_t num, uint32_t den)
+{
+    return num > 0 && den > 0 && num <= 1000000 && den <= 1000000 &&
+           num >= den && static_cast<uint64_t>(num) <= static_cast<uint64_t>(den) * 1000;
+}
 
 inline uint32_t Yuy2Bytes(uint32_t w, uint32_t h) { return w * h * 2; }
 inline uint32_t Nv12Bytes(uint32_t w, uint32_t h) { return w * h * 3 / 2; }
@@ -146,18 +156,24 @@ class Writer
 public:
     ~Writer() { Close(); }
 
-    // Grants: SYSTEM/Admins/LOCAL SERVICE full, Everyone + app packages read.
+    // Grants: SYSTEM/Admins full; LOCAL SERVICE, Everyone and app packages read.
     // LOCAL SERVICE is what the Frame Server runs as. frameRegionBytes sizes the
-    // YUY2 region from the slot's LARGEST mode (defaults to the legacy 640x480
-    // size, so PS3 Eye / EyeToy callers are byte-for-byte unchanged); jpegCapacity
+    // YUY2 region, clamped to [kMaxFrameBytes, kAbsMaxFrameBytes]; jpegCapacity
     // is 0 for devices without an MJPEG sidecar.
-    bool Create(int cameraIndex, uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen,
+    [[nodiscard]] bool Create(int cameraIndex, uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen,
                 uint32_t frameRegionBytes = kMaxFrameBytes, uint32_t jpegCapacity = kMaxJpegBytes)
     {
-        if (frameRegionBytes < kMaxFrameBytes) frameRegionBytes = kMaxFrameBytes;  // never below legacy
+        if (frameRegionBytes < kMaxFrameBytes) frameRegionBytes = kMaxFrameBytes;
         if (frameRegionBytes > kAbsMaxFrameBytes) frameRegionBytes = kAbsMaxFrameBytes;
         if (jpegCapacity > kMaxJpegBytes) jpegCapacity = kMaxJpegBytes;
+        Close();
+        if (!ValidDimensions(width, height, frameRegionBytes) || !ValidRate(fpsNum, fpsDen))
+        {
+            _lastError = ERROR_INVALID_PARAMETER;
+            return false;
+        }
         _frameRegionBytes = frameRegionBytes;
+        _jpegCapacity = jpegCapacity;
         const uint32_t sectionBytes = kDataOffset + frameRegionBytes + jpegCapacity;
 
         wchar_t sectionName[64];
@@ -167,13 +183,25 @@ public:
 
         SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, FALSE };
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;AC)",
+                L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;LS)(A;;GR;;;WD)(A;;GR;;;AC)",
                 SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
+        {
+            _lastError = GetLastError();
             return false;
+        }
 
         _map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
                                   0, sectionBytes, sectionName);
         _lastError = GetLastError();
+        // CreateFileMapping reuses a surviving named section without applying
+        // its supplied descriptor. Apply the producer policy to that object too.
+        if (_map && !SetKernelObjectSecurity(_map, DACL_SECURITY_INFORMATION, sa.lpSecurityDescriptor))
+        {
+            _lastError = GetLastError();
+            LocalFree(sa.lpSecurityDescriptor);
+            Close();
+            return false;
+        }
         LocalFree(sa.lpSecurityDescriptor);
         if (!_map)
             return false;
@@ -186,6 +214,7 @@ public:
                 L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GRGX;;;WD)(A;;GRGX;;;AC)",
                 SDDL_REVISION_1, &evSa.lpSecurityDescriptor, nullptr))
         {
+            _lastError = GetLastError();
             Close();
             return false;
         }
@@ -193,7 +222,7 @@ public:
         LocalFree(evSa.lpSecurityDescriptor);
         if (!_frameReady) { _lastError = GetLastError(); Close(); return false; }
 
-        _view = MapViewOfFile(_map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+        _view = MapViewOfFile(_map, FILE_MAP_ALL_ACCESS, 0, 0, sectionBytes);
         if (!_view) { _lastError = GetLastError(); Close(); return false; }
 
         // Zero the whole header page (HotHeader + ColdBlock). The ColdBlock
@@ -217,26 +246,23 @@ public:
         return true;
     }
 
-    // Writes the device capability block. Cold path: called once on the capture
-    // thread before tryRegisterVCam(), so no reader can observe a torn block
-    // (the DLL only opens the bus after the camera is registered). Stores are
-    // followed by a release barrier so the modeCount/modes are visible before
-    // any later magic-gated read on another core.
+    // Capability changes use their own seqlock so a slot/view rescan cannot
+    // tear the mode table while an existing reader builds media types.
     void WriteColdBlock(uint32_t transportClass, uint32_t defaultFormat,
                         const ColdMode* modes, uint32_t modeCount)
     {
-        if (!_view)
+        if (!_view || (!modes && modeCount))
             return;
         if (modeCount > kMaxModes)
             modeCount = kMaxModes;
         auto* c = Cold();
+        InterlockedIncrement(&c->seq);
         c->transportClass = transportClass;
-        c->defaultFormat  = defaultFormat;
-        c->pad0           = 0;
+        c->defaultFormat = defaultFormat;
+        c->modeCount = modeCount;
         for (uint32_t i = 0; i < modeCount; ++i)
             c->modes[i] = modes[i];
-        MemoryBarrier();
-        c->modeCount = modeCount;   // published last: nonzero means the rest is valid
+        InterlockedIncrement(&c->seq);
     }
 
     void Publish(const uint8_t* yuy2, uint32_t bytes)
@@ -263,8 +289,8 @@ public:
     {
         if (bytes > _frameRegionBytes)              // never write past the YUY2 region
             bytes = _frameRegionBytes;
-        if (len > kMaxJpegBytes)
-            len = kMaxJpegBytes;
+        if (len > _jpegCapacity)
+            len = 0;   // an incomplete JPEG is not a valid sidecar
         auto* h = Hdr();
         InterlockedIncrement64(&h->seq);
         memcpy(Data(), yuy2, bytes);
@@ -301,6 +327,8 @@ public:
     // readers treat every future frame as stale.
     void UpdateFormat(uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen)
     {
+        if (!_view || !ValidDimensions(width, height, _frameRegionBytes) || !ValidRate(fpsNum, fpsDen))
+            return;
         auto* h = Hdr();
         InterlockedIncrement64(&h->seq);
         h->width  = width;
@@ -348,9 +376,32 @@ private:
     void*    _view = nullptr;
     DWORD    _lastError = 0;
     uint32_t _frameRegionBytes = kMaxFrameBytes;  // YUY2 region size; JPEG begins after it
+    uint32_t _jpegCapacity = 0;
 };
 
 // ---------------------------------------------------------------- Reader ----
+
+// Retry pacing for a reader that found a write in progress. A publish holds the
+// sequence odd for the whole frame copy -- about half a millisecond for a PS4
+// side-by-side frame -- which is thousands of spins. Spin briefly for the common
+// short window, then yield the CPU, and give up only after a budget no publish
+// comes near: failing here fails a client's camera activation outright.
+class SeqRetry
+{
+public:
+    bool Again()
+    {
+        if (_spins < 64) { ++_spins; YieldProcessor(); return true; }
+        const ULONGLONG now = GetTickCount64();
+        if (!_deadline) _deadline = now + 50;
+        if (now >= _deadline) return false;
+        SwitchToThread();
+        return true;
+    }
+private:
+    int       _spins = 0;
+    ULONGLONG _deadline = 0;
+};
 
 class Reader
 {
@@ -361,40 +412,25 @@ public:
     {
         if (_view)
             return true;
-        wchar_t sectionName[64];
-        wchar_t eventName[64];
+        wchar_t sectionName[64], eventName[64];
         ipcnames::Format(sectionName, L".FrameBus", cameraIndex);
         ipcnames::Format(eventName, L".FrameReady", cameraIndex);
-
         _map = OpenFileMappingW(FILE_MAP_READ, FALSE, sectionName);
         if (!_map)
             return false;
         _view = MapViewOfFile(_map, FILE_MAP_READ, 0, 0, 0);
         if (!_view) { Close(); return false; }
-        if (Hdr()->magic != kMagic) { Close(); return false; }
 
-        // How much of the section lies past the YUY2 region — i.e. how big the
-        // JPEG sidecar actually is. A slot whose device has no sidecar reserves
-        // ZERO bytes for one, so the per-frame jpegLen (shared memory, and thus
-        // able to tear or be corrupt) must be clamped against this and not
-        // merely against kMaxJpegBytes, or a nonzero length on such a slot would
-        // read past the end of the mapping. Measured from the mapping rather
-        // than added to HotHeader: no wire-format change, and the mapped size is
-        // the ground truth the clamp actually needs.
-        _sidecarBytes = 0;
         MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(_view, &mbi, sizeof(mbi)) == sizeof(mbi))
-        {
-            const uint64_t payloadOffset =
-                static_cast<uint64_t>(kDataOffset) + Hdr()->frameRegionBytes;
-            if (mbi.RegionSize > payloadOffset)
-                _sidecarBytes = static_cast<uint32_t>(
-                    (mbi.RegionSize - payloadOffset) > kMaxJpegBytes
-                        ? kMaxJpegBytes : (mbi.RegionSize - payloadOffset));
-        }
-        // The writer creates the event before publishing the magic, so a live
-        // section implies the event exists. Treat a failed open as "not ready
-        // yet" — the caller retries the whole open later.
+        if (VirtualQuery(_view, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT || mbi.RegionSize < kDataOffset)
+        { Close(); return false; }
+        _mappedBytes = mbi.RegionSize;
+        HotHeader fmt{};
+        if (!ReadFormat(fmt)) { Close(); return false; }
+        _frameRegionBytes = fmt.frameRegionBytes;
+        const size_t spare = _mappedBytes - kDataOffset - _frameRegionBytes;
+        _sidecarBytes = static_cast<uint32_t>(spare > kMaxJpegBytes ? kMaxJpegBytes : spare);
         _frameReady = OpenEventW(SYNCHRONIZE, FALSE, eventName);
         if (!_frameReady) { Close(); return false; }
         return true;
@@ -404,9 +440,11 @@ public:
 
     void Close()
     {
-        if (_view)       { UnmapViewOfFile(_view); _view = nullptr; }
-        if (_map)        { CloseHandle(_map); _map = nullptr; }
+        if (_view) { UnmapViewOfFile(_view); _view = nullptr; }
+        if (_map) { CloseHandle(_map); _map = nullptr; }
         if (_frameReady) { CloseHandle(_frameReady); _frameReady = nullptr; }
+        _mappedBytes = 0;
+        _frameRegionBytes = 0;
         _sidecarBytes = 0;
     }
 
@@ -414,158 +452,124 @@ public:
     {
         if (!_view)
             return false;
-        out = *Hdr();
-        // v4: validate against the slot's reserved frame region (per-device),
-        // not the legacy 640x480 cap. The width/height sanity bound (<=4096)
-        // also guards Yuy2Bytes against overflow on a corrupt header.
-        return out.magic == kMagic && out.version == kVersion &&
-               out.payloadFormat == kFormatYUY2 &&
-               out.width > 0 && out.width <= 4096 &&
-               out.height > 0 && out.height <= 4096 &&
-               out.frameRegionBytes <= kAbsMaxFrameBytes &&
-               Yuy2Bytes(out.width, out.height) <= out.frameRegionBytes &&
-               out.fpsNum > 0 && out.fpsDen > 0;
+        for (SeqRetry retry; retry.Again(); )
+        {
+            const LONG64 seq = ReadAcquire64(&Hdr()->seq);
+            if (seq & 1) continue;
+            HotHeader snapshot = *Hdr();
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq != ReadNoFence64(&Hdr()->seq))
+                continue;                   // torn by a publish: read again
+            if (!ValidHeader(snapshot))
+                return false;               // coherent but invalid: not transient
+            out = snapshot;
+            return true;
+        }
+        return false;
     }
 
-    // Copies the device capability block. Cold path: the block is written once
-    // before the camera is registered, so a plain copy (no seqlock) is correct.
-    // Returns false until a valid, populated block is present.
     bool ReadColdBlock(ColdBlock& out)
     {
-        if (!_view)
+        HotHeader fmt{};
+        if (!ReadFormat(fmt))
             return false;
-        const HotHeader* h = Hdr();
-        if (h->magic != kMagic || h->version != kVersion)
-            return false;
-        out = *Cold();
-        return out.modeCount > 0 && out.modeCount <= kMaxModes;
+        for (SeqRetry retry; retry.Again(); )
+        {
+            const LONG seq = ReadAcquire(&Cold()->seq);
+            if (seq & 1) continue;
+            ColdBlock snapshot = *Cold();
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq != ReadNoFence(&Cold()->seq))
+                continue;
+            if (!snapshot.modeCount || snapshot.modeCount > kMaxModes ||
+                (snapshot.defaultFormat != kFmtYUY2 && snapshot.defaultFormat != kFmtNV12 &&
+                 snapshot.defaultFormat != kFmtMJPEG))
+                return false;
+            for (uint32_t i = 0; i < snapshot.modeCount; ++i)
+            {
+                const auto& m = snapshot.modes[i];
+                if (!ValidDimensions(m.width, m.height, fmt.frameRegionBytes) ||
+                    !ValidRate(m.fps, 1) || !m.formatMask ||
+                    (m.formatMask & ~(kFmtYUY2 | kFmtNV12 | kFmtMJPEG)))
+                    return false;
+            }
+            out = snapshot;
+            return true;
+        }
+        return false;
     }
 
-    // Sleeps until the writer pulses the frame-ready event (or the timeout
-    // elapses). Purely a wakeup hint: callers re-check TryReadNewer after.
     void WaitFrame(DWORD timeoutMs) const
     {
         if (_frameReady)
             WaitForSingleObject(_frameReady, timeoutMs);
     }
 
-    // Copies the newest frame into dst iff it differs from lastFrameId and the
-    // dimensions match. Returns the consumed frameId, or 0 if nothing new.
-    //
-    // frameId moving BACKWARDS means the host restarted and re-created the
-    // section (its counter restarts at 0 while the Frame Server kept the
-    // mapping alive); the frame is accepted so the picture recovers instantly
-    // instead of freezing until the counter catches back up.
-    //
-    // NOTE: this view is mapped FILE_MAP_READ, so the seqlock counters must be
-    // read with plain aligned loads (atomic on x64). Interlocked* intrinsics
-    // emit `lock` instructions that demand write access to the page and
-    // access-violate on a read-only mapping.
-    LONG64 TryReadNewer(uint8_t* dst, uint32_t dstBytes, LONG64 lastFrameId)
+    // Expected geometry is checked inside the payload sequence window.
+    // A backwards frameId is accepted to recover a restarted producer.
+    LONG64 TryReadNewer(uint8_t* dst, uint32_t dstBytes, LONG64 lastFrameId,
+                        uint32_t expectedWidth = 0, uint32_t expectedHeight = 0)
     {
-        if (!_view)
-            return 0;
-        const HotHeader* h = Hdr();
-        // version/magic are written once before the magic is published and never
-        // change, so a single non-seqlocked check is sufficient. Rejecting a
-        // version mismatch here stops an old reader from mis-decoding a section
-        // re-created by a newer writer during the Frame Server restart window.
-        if (h->magic != kMagic || h->version != kVersion ||
-            Yuy2Bytes(h->width, h->height) != dstBytes)
-            return 0;
-
-        // Bounded spin: the writer's copy window is tens of microseconds; if
-        // we keep colliding the caller waits on the frame-ready event and
-        // retries, so giving up here never drops a frame permanently.
-        for (int attempt = 0; attempt < 64; ++attempt)
-        {
-            const LONG64 seqBefore = ReadAcquire64(&h->seq);
-            if (seqBefore & 1)
-            {
-                YieldProcessor();
-                continue;
-            }
-            const LONG64 id = ReadAcquire64(&h->frameId);
-            if (id == 0 || id == lastFrameId)
-                return 0;
-
-            memcpy(dst, Data(), dstBytes);
-
-            // The fence orders the payload loads above before the seq
-            // re-validation below (x64 keeps loads ordered anyway; this makes
-            // the seqlock correct by construction, not by ISA accident).
-            std::atomic_thread_fence(std::memory_order_acquire);
-            const LONG64 seqAfter = ReadNoFence64(&h->seq);
-            if (seqBefore == seqAfter)
-                return id;  // copy was not torn
-        }
-        return 0;
+        uint32_t unused = 0;
+        return dst ? TryReadNewer(dst, dstBytes, nullptr, 0, unused, lastFrameId,
+                                  expectedWidth, expectedHeight) : 0;
     }
 
-    // MJPEG overload: copies the JFIF sidecar (and optionally the YUY2 frame)
-    // atomically under the same seqlock window. jpegLen is
-    // read and clamped INSIDE the window so a torn/corrupt length can never
-    // drive an over-read past the section or the caller's buffer. outJpegLen
-    // receives the bytes actually copied (0 if the frame carries no sidecar).
-    //
-    // dstBytes always names the expected YUY2 size and is validated against the
-    // current bus dimensions (the passthrough guard — a JPEG can't be rescaled
-    // without decoding). Pass dst=nullptr for a JPEG-only client to skip the
-    // YUY2 copy entirely. A YUY2-only caller uses the 3-arg overload above.
     LONG64 TryReadNewer(uint8_t* dst, uint32_t dstBytes,
                         uint8_t* jpegDst, uint32_t jpegCap, uint32_t& outJpegLen,
-                        LONG64 lastFrameId)
+                        LONG64 lastFrameId, uint32_t expectedWidth = 0,
+                        uint32_t expectedHeight = 0)
     {
         outJpegLen = 0;
         if (!_view)
             return 0;
-        const HotHeader* h = Hdr();
-        if (h->magic != kMagic || h->version != kVersion ||
-            Yuy2Bytes(h->width, h->height) != dstBytes)
-            return 0;
-
         for (int attempt = 0; attempt < 64; ++attempt)
         {
-            const LONG64 seqBefore = ReadAcquire64(&h->seq);
-            if (seqBefore & 1)
-            {
-                YieldProcessor();
+            const LONG64 seq = ReadAcquire64(&Hdr()->seq);
+            if (seq & 1) { YieldProcessor(); continue; }
+            const HotHeader h = *Hdr();
+            if (!ValidHeader(h) || Yuy2Bytes(h.width, h.height) != dstBytes ||
+                (expectedWidth && h.width != expectedWidth) ||
+                (expectedHeight && h.height != expectedHeight) ||
+                h.frameId <= 0 || h.frameId == lastFrameId)
                 continue;
-            }
-            const LONG64 id = ReadAcquire64(&h->frameId);
-            if (id == 0 || id == lastFrameId)
+            if (jpegDst && (h.jpegLen > _sidecarBytes || h.jpegLen > jpegCap))
                 return 0;
-
-            uint32_t len = h->jpegLen;          // read inside the window...
-            if (len > _sidecarBytes) len = _sidecarBytes;  // ...then clamp to what the
-            if (jpegDst && len > jpegCap) len = jpegCap;   // section and the caller hold
-
             if (dst)
                 memcpy(dst, Data(), dstBytes);
-            if (jpegDst && len)
-                memcpy(jpegDst, Jpeg(), len);
-
+            if (jpegDst && h.jpegLen)
+                memcpy(jpegDst, Jpeg(), h.jpegLen);
             std::atomic_thread_fence(std::memory_order_acquire);
-            const LONG64 seqAfter = ReadNoFence64(&h->seq);
-            if (seqBefore == seqAfter)
+            if (seq == ReadNoFence64(&Hdr()->seq))
             {
-                outJpegLen = (jpegDst ? len : 0);
-                return id;  // copy was not torn
+                outJpegLen = jpegDst ? h.jpegLen : 0;
+                return h.frameId;
             }
         }
         return 0;
     }
 
 private:
-    const HotHeader* Hdr()  const { return static_cast<const HotHeader*>(_view); }
+    bool ValidHeader(const HotHeader& h) const
+    {
+        return h.magic == kMagic && h.version == kVersion && h.payloadFormat == kFormatYUY2 &&
+               h.frameRegionBytes > 0 && h.frameRegionBytes <= kAbsMaxFrameBytes &&
+               (!_frameRegionBytes || h.frameRegionBytes == _frameRegionBytes) &&
+               static_cast<uint64_t>(kDataOffset) + h.frameRegionBytes <= _mappedBytes &&
+               ValidDimensions(h.width, h.height, h.frameRegionBytes) &&
+               ValidRate(h.fpsNum, h.fpsDen);
+    }
+    const HotHeader* Hdr() const { return static_cast<const HotHeader*>(_view); }
     const ColdBlock* Cold() const { return reinterpret_cast<const ColdBlock*>(static_cast<const uint8_t*>(_view) + kColdOffset); }
-    const uint8_t*   Data() const { return static_cast<const uint8_t*>(_view) + kDataOffset; }
-    const uint8_t*   Jpeg() const { return static_cast<const uint8_t*>(_view) + kDataOffset + Hdr()->frameRegionBytes; }
+    const uint8_t* Data() const { return static_cast<const uint8_t*>(_view) + kDataOffset; }
+    const uint8_t* Jpeg() const { return Data() + _frameRegionBytes; }
 
-    HANDLE   _map = nullptr;
-    HANDLE   _frameReady = nullptr;
-    void*    _view = nullptr;
-    uint32_t _sidecarBytes = 0;   // JPEG bytes this section actually reserves
+    HANDLE _map = nullptr;
+    HANDLE _frameReady = nullptr;
+    void* _view = nullptr;
+    size_t _mappedBytes = 0;
+    uint32_t _frameRegionBytes = 0;
+    uint32_t _sidecarBytes = 0;
 };
 
 } // namespace framebus

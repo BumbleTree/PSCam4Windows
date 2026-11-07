@@ -9,21 +9,21 @@
 // functionally.
 //
 #define PSCAM_VERSION_MAJOR 4
-#define PSCAM_VERSION_MINOR 0
+#define PSCAM_VERSION_MINOR 1
 #define PSCAM_VERSION_PATCH 0
 #define PSCAM_VERSION_REV   0
 
 #define PSCAM_STR_(x) #x
 #define PSCAM_STR(x)  PSCAM_STR_(x)
 
-// 4,0,0,0 -- FILEVERSION / PRODUCTVERSION
+// 4,1,0,0 -- FILEVERSION / PRODUCTVERSION
 #define PSCAM_VERSION_COMMA \
     PSCAM_VERSION_MAJOR,PSCAM_VERSION_MINOR,PSCAM_VERSION_PATCH,PSCAM_VERSION_REV
-// "4.0.0.0" -- FileVersion / ProductVersion string values
+// "4.1.0.0" -- FileVersion / ProductVersion string values
 #define PSCAM_VERSION_STRING \
     PSCAM_STR(PSCAM_VERSION_MAJOR) "." PSCAM_STR(PSCAM_VERSION_MINOR) "." \
     PSCAM_STR(PSCAM_VERSION_PATCH) "." PSCAM_STR(PSCAM_VERSION_REV)
-// "4.0.0" -- user-facing (Add/Remove Programs, wizard header)
+// "4.1.0" -- user-facing (Add/Remove Programs, wizard header)
 #define PSCAM_VERSION_DISPLAY \
     PSCAM_STR(PSCAM_VERSION_MAJOR) "." PSCAM_STR(PSCAM_VERSION_MINOR) "." \
     PSCAM_STR(PSCAM_VERSION_PATCH)

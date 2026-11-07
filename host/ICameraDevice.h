@@ -21,12 +21,11 @@
 // libusb's WinUSB backend; kept distinct because their capture loops and
 // per-frame work differ. USB3_Custom is reserved for a future camera.
 //
-// NOTE the PS4 correction: the original scaffold reserved `UVC_Inbox = 3`
-// ("PS4 — inbox usbvideo.sys, no libusb"). That assumption was WRONG. The PS4
-// camera enumerates in an OmniVision OV580 *bootloader* (05A9:0580), does
-// nothing until a firmware blob is uploaded over USB, then re-enumerates as
-// 05A9:058A and streams raw-Bayer stereo isochronously on EP 0x81 — driven by
-// libusb exactly like the EyeToy, not by usbvideo.sys. Hence `Usb_Ps4`.
+// The PS4 camera is NOT an inbox-UVC (usbvideo.sys) device: it enumerates as an
+// OmniVision OV580 *bootloader* (05A9:0580) that does nothing until a firmware
+// blob is uploaded over USB, then re-enumerates (05A9:058A / 058B) and streams
+// stereo isochronously on EP 0x81 — driven by libusb exactly like the EyeToy.
+// Hence `Usb_Ps4`. The values are published raw in the FrameBus ColdBlock.
 enum class TransportClass : uint32_t
 {
     None           = 0,
@@ -83,25 +82,24 @@ enum ControlBits : uint32_t
                                   // unlike CTRL_GAIN there is no "manual mode" to
                                   // enter first. Drives the same Settings::gain
                                   // value and the same dialog row as CTRL_GAIN.
-    CTRL_SHARPNESS   = 1u << 12,  // PU_SHARPNESS 0..8. Measured on the PS4 ISP:
-                                  // detail 3.05 -> 5.14 across the range (+68 %),
-                                  // invisible to luma-only photometry, which is
-                                  // why it looked dead until the right metric.
-    CTRL_POWERLINE   = 1u << 13,  // mains anti-flicker 0/50/60 Hz. A correctness
-                                  // control, not a preference: the ISP default is
-                                  // 50 Hz, so 60 Hz regions band with no recourse.
+    CTRL_WB_TEMP     = 1u << 10,  // white-balance TEMPERATURE slider (single Kelvin
+                                  // axis), as opposed to CTRL_WB_MANUAL's per-channel
+                                  // R/G/B gains. Interlocked with the AWB toggle.
     CTRL_MICARRAY    = 1u << 11,  // device has an in-band microphone array the
                                   // dialog should show meters + a recorder for.
                                   // CAPABILITY only: whether audio is flowing
                                   // right now is AudioChannels(), which is the
-                                  // interlock that greys the block. Getting that
-                                  // split wrong is what made the block invisible
-                                  // -- it was hidden on "no audio yet", which is
-                                  // always true at the instant a camera is
-                                  // selected, so it never came back.
-    CTRL_WB_TEMP     = 1u << 10,  // white-balance TEMPERATURE slider (single Kelvin
-                                  // axis), as opposed to CTRL_WB_MANUAL's per-channel
-                                  // R/G/B gains. Interlocked with the AWB toggle.
+                                  // interlock that greys the block. Hiding the
+                                  // block on "no audio yet" would hide it for
+                                  // good: that is always true at the instant a
+                                  // camera is selected.
+    CTRL_SHARPNESS   = 1u << 12,  // PU_SHARPNESS 0..8. Measured on the PS4 ISP:
+                                  // detail 3.05 -> 5.14 across the range (+68 %),
+                                  // invisible to luma-only photometry, so measure
+                                  // it on detail, not brightness.
+    CTRL_POWERLINE   = 1u << 13,  // mains anti-flicker 0/50/60 Hz. A correctness
+                                  // control, not a preference: the ISP default is
+                                  // 50 Hz, so 60 Hz regions band with no recourse.
 };
 
 // What a control's stored 0..255 (or 0..63) range means on this device, for the
@@ -120,6 +118,7 @@ struct ControlRange
 
 // Static, data-only description of a supported camera. New cameras add a profile
 // (and an ICameraDevice subclass only if their transport isn't already covered).
+// vid/pid and hasLed are descriptive: nothing currently branches on them.
 struct DeviceProfile
 {
     uint16_t vid;
@@ -130,7 +129,7 @@ struct DeviceProfile
     uint32_t modeCount;
     uint32_t formatMask;            // FMT_* the DLL may advertise for this device
     VideoMode defaultMode;
-    uint32_t defaultFormat;         // FMT_NV12 (PS3 Eye) or FMT_YUY2 (EyeToy)
+    uint32_t defaultFormat;         // FMT_NV12 (PS3 Eye) or FMT_YUY2 (EyeToy, PS4)
     bool hasLed;
     uint32_t controlMask;           // CTRL_* the Settings dialog should enable
     const ControlRange* ranges = nullptr;   // optional; null = all continuous
@@ -168,6 +167,7 @@ struct AcquiredFrame
     uint32_t       yuy2Bytes;
     const uint8_t* jpeg;
     uint32_t       jpegBytes;
+    VideoMode      mode{};     // optional geometry from the same pixel snapshot
 };
 
 class ICameraDevice

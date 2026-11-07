@@ -3,12 +3,12 @@
 #include "AudioRender.h"
 #include "../common/AudioStatusBus.h"
 
-#include <shlobj.h>   // SHGetFolderPathW / CSIDL_MYVIDEO for the mic recording path
+#include <shlobj.h>   // SHGetKnownFolderPath / FOLDERID_Videos for the mic recording path
 
 #include <mfapi.h>
 #include <wrl/client.h>
-#include <cstdio>
 #include <memory>
+#include <functional>
 
 #include "HostLog.h"
 #include "ICameraDevice.h"
@@ -23,6 +23,10 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
+// Bit i set while slot i has a fresh external (ControlBus) client. Lets one half
+// of a split PS4 see that the other half is in use before touching the shared
+// stream's mode.
+std::atomic<unsigned> g_externalSlots{0};
 
 // MFCreateVirtualCamera lives in mfsensorgroup.dll (Windows 11 22000+).
 // Resolved once for the whole process; the module is never freed (its
@@ -53,9 +57,8 @@ bool CaptureController::Start(int cameraIndex, HWND notifyWnd, UINT notifyMsg)
         // Device-aware initial mode: if a recognised camera occupies this slot
         // and the persisted mode isn't one it can serve, fall back to that
         // device's default mode (e.g. an EyeToy slot persisted with the PS3's
-        // 640x480@60 default). No-op for the PS3 Eye (its default mode is one of
-        // its own modes) and for empty slots (no profile), so the PS3 path and
-        // slot↔mode mapping are unchanged.
+        // 640x480@60 default). A persisted mode the device can serve, and an
+        // empty slot (no profile), are left as they are.
         if (const DeviceProfile* prof = deviceregistry::ProfileForSlot(_cameraIndex))
         {
             if (!ProfileHasMode(*prof, _desired.width, _desired.height, _desired.fps))
@@ -81,30 +84,24 @@ void CaptureController::Stop()
 {
     if (_stopEvent)
         SetEvent(_stopEvent);
-    bool joined = true;
     if (_thread)
     {
-        joined = (WaitForSingleObject(_thread, 15000) == WAIT_OBJECT_0);
-        if (!joined)
-            HostLog(L"camera %d: thread did not exit within 15s -- abandoning it", _cameraIndex);
+        if (WaitForSingleObject(_thread, 15000) != WAIT_OBJECT_0)
+        {
+            // Still running: a USB cancellation or the Frame Server is slow to
+            // answer. Freeing its state under it would be a use-after-free, so
+            // keep waiting; the tray's exit deadline bounds this at shutdown.
+            HostLog(L"camera %d: still tearing down after 15 s -- waiting", _cameraIndex);
+            WaitForSingleObject(_thread, INFINITE);
+        }
         CloseHandle(_thread);
         _thread = nullptr;
-    }
-
-    // Leak the events if the join failed: an abandoned thread is still waiting on
-    // them and still owns a FrameBus writer on its stack, so closing them risks a
-    // use-after-free on the recycled handles. The process is exiting anyway.
-    if (!joined)
-    {
-        _stopEvent   = nullptr;
-        _cmdEvent    = nullptr;
-        _rescanEvent = nullptr;
-        return;
     }
 
     if (_stopEvent)   { CloseHandle(_stopEvent);   _stopEvent = nullptr; }
     if (_cmdEvent)    { CloseHandle(_cmdEvent);    _cmdEvent = nullptr; }
     if (_rescanEvent) { CloseHandle(_rescanEvent); _rescanEvent = nullptr; }
+    g_externalSlots.fetch_and(~(1u << _cameraIndex), std::memory_order_relaxed);
 }
 
 void CaptureController::UpdateSettings(const Settings& s)
@@ -174,7 +171,7 @@ void CaptureController::Run()
     //
     // Sizing from the startup occupant instead is unsafe: a PS4 plugged into a slot
     // that was empty (the normal "replug after restart" flow) or that held a
-    // PS3/EyeToy at launch would publish a 2-4 MB frame into the 614 KB legacy
+    // PS3/EyeToy at launch would publish a 2-4 MB frame into the 614 KB minimum
     // section and overrun it (host crash). PublishBlack/Publish are also clamped to
     // the section size in FrameBus.h as defence-in-depth.
     if (!bus.Create(_cameraIndex, active.width, active.height, active.fps, 1,
@@ -216,9 +213,9 @@ void CaptureController::Run()
             return;
         ++vcamAttempts;
         // The virtual camera advertises the name of the device that currently
-        // occupies the slot ("PS3 Eye" / "PS2 EyeToy"), numbered only when more
-        // than one camera of that type is present, so a lone EyeToy is just
-        // "PS2 EyeToy" rather than "PS2 EyeToy #7".
+        // occupies the slot ("PS3 Eye" / "PS2 EyeToy" / "PS4 Camera ..."),
+        // numbered only when more than one camera of that name is present, so a
+        // lone EyeToy is just "PS2 EyeToy" rather than "PS2 EyeToy #7".
         wchar_t friendlyName[64];
         deviceregistry::SlotDisplayName(_cameraIndex, friendlyName, 64);
         HRESULT hr = createVCam(MFVirtualCameraType_SoftwareCameraSource,
@@ -246,6 +243,7 @@ void CaptureController::Run()
     };
 
     auto unregisterVCam = [&]() {
+        g_externalSlots.fetch_and(~(1u << _cameraIndex), std::memory_order_relaxed);
         if (!vcamLive && !vcam)
             return;
         if (vcam)
@@ -268,10 +266,11 @@ void CaptureController::Run()
     }
 
     // ---- camera state ------------------------------------------------------
-    // The active device for this slot (PS3 Eye today). Built by the registry on
-    // wake, destroyed on sleep. AcquireFrame returns device-owned YUY2; the
-    // fused Bayer->YUY2 debayer lives inside the device, no RGB intermediate.
+    // The active device for this slot. Built by the registry on wake, destroyed
+    // on sleep. AcquireFrame returns device-owned YUY2; any debayer or JPEG
+    // decode happens inside the device.
     std::unique_ptr<ICameraDevice> device;
+    deviceregistry::Ps4SlotInfo deviceAssignment;
 
     // True while any of: (a) an external app is consuming frames (ControlBus
     // keepalive fresh), (b) the Settings dialog preview is open for this camera,
@@ -290,27 +289,55 @@ void CaptureController::Run()
     auto clientFresh = [&]() {
         const bool ext = control.ActivityAgeMs() < active.idleTimeoutMs;
         _externalClient.store(ext, std::memory_order_relaxed);
+        if (ext) g_externalSlots.fetch_or(1u << _cameraIndex, std::memory_order_relaxed);
+        else g_externalSlots.fetch_and(~(1u << _cameraIndex), std::memory_order_relaxed);
         return ext || _previewHold.load(std::memory_order_relaxed)
                    || _micHold.load(std::memory_order_relaxed);
     };
 
+    // A split pair's Right half has no mode of its own: both halves share one
+    // stream, whose geometry the home (Left) half chooses. Its own stored mode
+    // is whatever the slot held before it became a Right half, and comparing
+    // against that makes every Right-half setting change look like a mode
+    // change -- release, re-wake, re-register, and the client drops. Returns
+    // true and the owner's mode for a Right half; false for every other slot.
+    auto splitOwnerMode = [&](VideoMode& out) -> bool {
+        const auto slot = deviceregistry::QueryPs4Slot(_cameraIndex);
+        if (!(slot.isPs4 && slot.split && slot.view == Ps4ViewKind::Right) ||
+            slot.homeSlot < 0 || slot.homeSlot == _cameraIndex)
+            return false;
+        const Settings owner = settings::Load(slot.homeSlot);
+        out = VideoMode{ owner.width, owner.height, owner.fps };
+        return true;
+    };
+
     // Re-sync the slot's advertised capabilities (and the active mode) with the
-    // device that currently occupies it. Cold path: only ever called while
-    // Asleep (the camera is released), so rewriting the bus format and active
-    // mode here cannot disturb a live stream. Covers a camera hot-plugged into a
-    // slot that was empty — or held a different device — when Run() first
-    // published the ColdBlock, including the logon race where the USB stack had
-    // not finished enumerating the camera by the time Run() started.
+    // device that currently occupies it. Cold path: called while Asleep (the
+    // camera is released), or for a live in-place view switch, never in the
+    // middle of a frame. Covers a camera hot-plugged into a slot that was
+    // empty — or held a different device — when Run() first published the
+    // ColdBlock, including the logon race where the USB stack had not finished
+    // enumerating the camera by the time Run() started.
     auto readvertiseSlot = [&](const DeviceProfile* prof) {
         // If the active/persisted mode isn't one this device can serve (e.g. an
         // EyeToy landing in a slot that defaulted to the PS3's 640x480@60), fall
         // back to the device's default so Init() gets a valid mode and the bus
         // header advertises the real geometry.
-        if (!ProfileHasMode(*prof, active.width, active.height, active.fps))
+        VideoMode ownerMode{};
+        const bool followsOwner = splitOwnerMode(ownerMode) &&
+            ProfileHasMode(*prof, ownerMode.width, ownerMode.height, ownerMode.fps);
+        // A Right half advertises the owner's mode even when its own is valid:
+        // otherwise an app opens it at a size the shared stream is not producing.
+        const bool ownerDiffers = followsOwner &&
+            (ownerMode.width != active.width || ownerMode.height != active.height ||
+             ownerMode.fps != active.fps);
+        if (ownerDiffers || !ProfileHasMode(*prof, active.width, active.height, active.fps))
         {
-            active.width  = prof->defaultMode.width;
-            active.height = prof->defaultMode.height;
-            active.fps    = prof->defaultMode.fps;
+            const Settings saved = settings::Load(_cameraIndex);
+            const VideoMode mode = followsOwner ? ownerMode
+                : ProfileHasMode(*prof, saved.width, saved.height, saved.fps)
+                    ? VideoMode{saved.width, saved.height, saved.fps} : prof->defaultMode;
+            active.width = mode.width; active.height = mode.height; active.fps = mode.fps;
             bus.UpdateFormat(active.width, active.height, active.fps, 1);
             _pendingMode.store(false, std::memory_order_relaxed);
             AcquireSRWLockExclusive(&_settingsLock);
@@ -325,7 +352,9 @@ void CaptureController::Run()
         deviceregistry::PublishColdBlock(bus, _cameraIndex);
     };
 
+    std::function<void()> releaseAudio;
     auto releaseCamera = [&]() {
+        if (releaseAudio) releaseAudio();
         if (device)
         {
             device->Stop();   // sensor off, LED off, transfers cancelled, USB released
@@ -336,6 +365,17 @@ void CaptureController::Run()
         // live one). The slot keeps the same index throughout.
         deviceregistry::Rescan();
         _fpsX10.store(0, std::memory_order_relaxed);
+    };
+
+    auto sharedExternalClient = [&]() {
+        const unsigned others = g_externalSlots.load(std::memory_order_relaxed) & ~(1u << _cameraIndex);
+        if (!others) return false;
+        const auto self = deviceregistry::QueryPs4Slot(_cameraIndex);
+        if (!self.isPs4) return false;
+        for (int i = 0; i < kVCamCount; ++i)
+            if ((others & (1u << i)) && deviceregistry::QueryPs4Slot(i).portPath == self.portPath)
+                return true;
+        return false;
     };
 
     // Drains a UI settings snapshot. cameraLive: sensor settings are pushed to
@@ -350,10 +390,17 @@ void CaptureController::Run()
             desired = _desired;
             ReleaseSRWLockShared(&_settingsLock);
         }
+        VideoMode ownerMode{};
+        if (splitOwnerMode(ownerMode))
+        {
+            desired.width  = ownerMode.width;
+            desired.height = ownerMode.height;
+            desired.fps    = ownerMode.fps;
+        }
 
         if (!desired.SameMode(active))
         {
-            if (!cameraLive)
+            if (!cameraLive && !sharedExternalClient())
             {
                 // A RESOLUTION change invalidates the media types the Frame
                 // Server cached when the camera was registered. An app that
@@ -363,12 +410,9 @@ void CaptureController::Run()
                 // exactly how "the settings preview works but the camera app is
                 // black" presents. Re-register so open clients drop and
                 // re-acquire against the freshly advertised geometry; the DLL
-                // rebuilds its media types from the bus format on reopen.
-                //
-                // This is the same rule the profile-change path below follows for
-                // single-eye <-> SBS. It was missing here, so it only bit the
-                // user-selectable modes (PS4 640x400 / 320x192, PS3 Eye's
-                // thirteen), not the view switches.
+                // rebuilds its media types from the bus format on reopen. The
+                // profile-change path below follows the same rule for
+                // single-eye <-> SBS view switches.
                 //
                 // Frame rate alone does not need it: which types are DELIVERABLE
                 // depends on the dimensions, and every rate is already advertised.
@@ -389,8 +433,10 @@ void CaptureController::Run()
             }
             else
             {
-                _pendingMode.store(true, std::memory_order_relaxed);
-                HostLog(L"mode change queued until camera is idle");
+                // Logged on the transition only: while the other half of a split
+                // pair is in use, every Asleep pass re-queues this.
+                if (!_pendingMode.exchange(true, std::memory_order_relaxed))
+                    HostLog(L"camera %d: mode change queued until camera is idle", _cameraIndex);
             }
         }
 
@@ -403,6 +449,8 @@ void CaptureController::Run()
         if (cameraLive && sensorChanged && device)
             device->ApplySettings(active);
 
+        _pendingMode.store(!desired.SameMode(active), std::memory_order_relaxed);
+
         AcquireSRWLockExclusive(&_settingsLock);
         _active = active;
         ReleaseSRWLockExclusive(&_settingsLock);
@@ -411,6 +459,8 @@ void CaptureController::Run()
     // Publish mic levels for the UI and, while recording, append to the WAV.
     // Called once per captured frame from the loop below.
     WavWriter micWav;
+    uint64_t recordingGeneration = 0;
+    bool microphoneOwner = false;
     audiorender::Renderer micRender;
     audiostatus::Writer    micStatus;
     std::wstring  micRenderWant;                // last device id we acted on
@@ -419,19 +469,16 @@ void CaptureController::Run()
     bool          micKeepAwake = true;          // cached alongside micRenderPref
     ULONGLONG     micRenderChecked = 0;
     ULONGLONG     micStatusPublished = 0;         // last status-block publish
+    ULONGLONG     micRenderRetryDue = 0;
     auto pumpMicrophone = [&](ICameraDevice* dev)
     {
         const uint32_t ch = dev ? dev->AudioChannels() : 0;
         _micChannels.store(ch, std::memory_order_relaxed);
 
-        // Created on FIRST AUDIO, not from the profile at thread start: the slot
-        // may be empty when this thread starts and gain a PS4 later, and a
-        // decision taken up there would then never be revisited. Keying on real
-        // audio also keeps a PS3 Eye slot from clobbering the block with
-        // channels=0 while the PS4 is live -- there is one block, not one per
-        // slot, because there is one array.
+        // Publish per owning slot so separate physical microphones cannot
+        // race on a single-writer status block.
         if (ch && !micStatus.Valid())
-            micStatus.Create();
+            micStatus.Create(_cameraIndex);
 
         // One clock read for both throttles below (settings re-read, status
         // publish); this runs per captured frame, i.e. up to 240 times a second.
@@ -455,10 +502,11 @@ void CaptureController::Run()
             // it does not carry. Clearing the hold does NOT stop routing -- it
             // just stops routing from being a reason to stay awake, so audio
             // still flows whenever something else has the camera open.
-            _micHold.store(ch != 0 && !micRenderPref.empty() && micKeepAwake,
+            _micHold.store(microphoneOwner && !micRenderPref.empty() && micKeepAwake,
                            std::memory_order_relaxed);
-            if (want != micRenderWant)
+            if (want != micRenderWant || (!want.empty() && !micRender.Running() && now >= micRenderRetryDue))
             {
+                micRenderRetryDue = now + 2000;
                 micRenderWant = want;
                 micRenderName.clear();
                 if (want.empty()) micRender.Stop();
@@ -479,6 +527,11 @@ void CaptureController::Run()
                 micWav.Close();
                 _micRecording.store(false, std::memory_order_release);
             }
+            const auto request = _recording.Snapshot();
+            recordingGeneration = request.generation;
+            if (_recording.Status() != RecordingCommands::State::Failed)
+                _recording.Acknowledge(request.generation, request.start || micWav.WriteFailed()
+                    ? RecordingCommands::State::Failed : RecordingCommands::State::Stopped);
             // Never hold an output device with nothing to send it.
             if (micRender.Running()) { micRender.Stop(); micRenderWant.clear(); }
             return;
@@ -489,31 +542,26 @@ void CaptureController::Run()
             for (uint32_t c = 0; c < ch && c < kMicMaxChannels; ++c)
                 _micLevel[c].store((uint32_t)(levels[c] * 10000.0f), std::memory_order_relaxed);
 
-        const bool want = _micRecording.load(std::memory_order_acquire);
-        if (want && !micWav.IsOpen())
+        const auto request = _recording.Snapshot();
+        if (request.generation != recordingGeneration)
         {
-            if (!micWav.Open(_micRecPath.c_str(), dev->AudioSampleRate(), (uint16_t)ch))
+            if (micWav.IsOpen())
             {
-                HostLog(L"mic: could not open the recording file");
-                _micRecording.store(false, std::memory_order_release);
-                return;
+                micWav.Close();
+                if (micWav.WriteFailed()) HostLog(L"mic: recording finalization failed");
             }
-            HostLog(L"mic: recording %u ch @ %u Hz", ch, dev->AudioSampleRate());
-        }
-        else if (!want && micWav.IsOpen())
-        {
-            const double secs = micWav.Seconds();
-            micWav.Close();   // patches the RIFF/data sizes; can fail too
-            if (micWav.WriteFailed())
-                HostLog(L"mic: recording TRUNCATED after %.1f s -- the file is short "
-                        L"(disk full, or the volume went away)", secs);
-            else
-                HostLog(L"mic: stopped after %.1f s", secs);
+            recordingGeneration = request.generation;
+            const bool started = request.start && micWav.Open(request.path.c_str(), dev->AudioSampleRate(), (uint16_t)ch);
+            _micRecording.store(started, std::memory_order_release);
+            _recording.Acknowledge(request.generation,
+                started ? RecordingCommands::State::Recording :
+                (request.start || micWav.WriteFailed() ? RecordingCommands::State::Failed : RecordingCommands::State::Stopped));
+            if (request.start && !started) HostLog(L"mic: could not open the recording file");
         }
 
         // Always drain, recording or not: an undrained ring only discards its
         // oldest second, but draining keeps the levels tracking real time.
-        static const uint32_t kChunk = 2048;
+        constexpr uint32_t kChunk = 2048;
         int16_t buf[kChunk * kMicMaxChannels];
         for (;;)
         {
@@ -536,6 +584,7 @@ void CaptureController::Run()
                     HostLog(L"mic: write failed -- stopping the recording");
                     micWav.Close();
                     _micRecording.store(false, std::memory_order_release);
+                    _recording.Acknowledge(recordingGeneration, RecordingCommands::State::Failed);
                     break;
                 }
             }
@@ -557,7 +606,9 @@ void CaptureController::Run()
             b.nominalRate = dev->AudioSampleRate();
             b.measuredRateMilliHz = dev->AudioMeasuredRateMilliHz();
             b.dropouts = _micDropouts.load(std::memory_order_relaxed);
-            for (uint32_t c = 0; c < 4 && c < ch; ++c)
+            static_assert(sizeof(b.levels) / sizeof(b.levels[0]) == kMicMaxChannels,
+                          "status block carries every mic channel");
+            for (uint32_t c = 0; c < kMicMaxChannels && c < ch; ++c)
                 b.levels[c] = _micLevel[c].load(std::memory_order_relaxed);
             const audiorender::Status rs = micRender.GetStatus();
             b.renderActive     = rs.active ? 1u : 0u;
@@ -571,6 +622,8 @@ void CaptureController::Run()
             micStatus.Publish(b);
         }
     };
+
+    releaseAudio = [&] { pumpMicrophone(nullptr); };
 
     auto applyPendingMode = [&]() {  // call only with the camera off
         if (!_pendingMode.load(std::memory_order_relaxed))
@@ -587,7 +640,18 @@ void CaptureController::Run()
         device = deviceregistry::Acquire(_cameraIndex);
         if (!device)
             return WakeResult::SlotEmpty;
-        const VideoMode mode{ active.width, active.height, active.fps };
+        VideoMode mode{ active.width, active.height, active.fps };
+        const auto slot = deviceregistry::QueryPs4Slot(_cameraIndex);
+        deviceAssignment = slot;
+        if (slot.isPs4 && slot.split && slot.view == Ps4ViewKind::Right && slot.homeSlot >= 0)
+        {
+            const Settings owner = settings::Load(slot.homeSlot);
+            mode = VideoMode{ owner.width, owner.height, owner.fps };
+            if (!ProfileHasMode(device->Profile(), mode.width, mode.height, mode.fps))
+                mode = device->Profile().defaultMode;
+        }
+        microphoneOwner = deviceregistry::OwnsMicrophone(&device->Profile(),
+                                                        deviceregistry::QueryPs4Slot(_cameraIndex));
         if (!device->Init(mode))   // releases the USB handle on failure
         {
             device.reset();
@@ -606,16 +670,11 @@ void CaptureController::Run()
                     active.width, active.height, active.fps);
             active.width = actual.width; active.height = actual.height; active.fps = actual.fps;
             bus.UpdateFormat(active.width, active.height, active.fps, 1);
-            // NOTE: this changes the advertised geometry without re-registering,
-            // so it carries the same staleness risk drainSettings guards against
-            // — a client that already negotiated the requested size would go
-            // black. Deliberately not re-registered here: we are mid-wake with a
-            // client waiting, and dropping it now risks a wake/sleep oscillation.
-            // It only diverges when the two halves of a PS4 split pair are set to
-            // DIFFERENT modes; if that turns out to bite, the fix is to reconcile
-            // on the next Asleep pass, where re-registering is free.
-            // The DLL now traces "BLACK -- negotiated AxB but bus is CxD" once,
-            // so this is diagnosable instead of silent.
+            AcquireSRWLockExclusive(&_settingsLock);
+            _active = active;
+            ReleaseSRWLockExclusive(&_settingsLock);
+            unregisterVCam();
+            tryRegisterVCam();
         }
         device->ApplySettings(active);
         if (!device->Start())
@@ -664,10 +723,11 @@ void CaptureController::Run()
                           KEY_NOTIFY, &settingsWatchKey) != ERROR_SUCCESS)
         { settingsWatchKey = nullptr; return; }
         ResetEvent(settingsChanged);
-        // Subtree FALSE: MicRenderDevice is a value on this key, while every
-        // per-camera setting lives in a Camera%d SUBkey. Watching the subtree
-        // would wake all eight sleeping controllers on every slider persist,
-        // for a value none of them read.
+        // Subtree FALSE: the global microphone values live on this key, while
+        // cameras 1..7 keep their settings in Camera%d SUBkeys. Watching the
+        // subtree would wake all eight sleeping controllers on every slider
+        // persist, for values none of them read. (Camera 0's settings share
+        // this key, so its persists still wake them; an Asleep pass is cheap.)
         RegNotifyChangeKeyValue(settingsWatchKey, FALSE, REG_NOTIFY_CHANGE_LAST_SET,
                                 settingsChanged, TRUE);
     };
@@ -713,22 +773,27 @@ void CaptureController::Run()
                 }
                 if (present && !vcamLive)
                     tryRegisterVCam();
-                else if (!present && vcamLive)
+                else if (!present)
+                {
                     unregisterVCam();
+                    bus.PublishBlack();
+                    bus.WriteColdBlock(0, framebus::kFmtYUY2, nullptr, 0);
+                    publishedProfile = nullptr;
+                }
 
                 // Mic-only wake has to be decided HERE as well as in the capture
                 // pump, or it could never start: the pump only runs while
                 // streaming, so a sleeping camera would wait for a hold that
                 // waits for the camera. Asleep we have no device to ask, so the
                 // slot's PROFILE answers whether it has an array at all.
-                _micHold.store(present && prof &&
-                               (prof->controlMask & CTRL_MICARRAY) != 0 &&
+                _micHold.store(present && deviceregistry::OwnsMicrophone(prof, deviceregistry::QueryPs4Slot(_cameraIndex)) &&
                                !settings::LoadMicRenderDevice().empty() &&
                                settings::LoadMicKeepAwake(),
                                std::memory_order_relaxed);
             }
 
-            if (vcamLive && clientFresh())
+            const bool fresh = clientFresh();
+            if (vcamLive && fresh)
             {
                 phase = Phase::Waking;
                 break;
@@ -738,6 +803,7 @@ void CaptureController::Run()
                                   : (vcamLive ? State::Asleep : State::VCamFailed));
 
             DWORD timeout = INFINITE;
+            if (_pendingMode.load(std::memory_order_relaxed)) timeout = 500;
             if (createVCam)
             {
                 const ULONGLONG now = GetTickCount64();
@@ -783,7 +849,7 @@ void CaptureController::Run()
             if (wake == WakeResult::SlotEmpty)
             {
                 // Device physically gone: take the virtual camera offline so
-                // apps stop seeing a dead "PS3 Eye" entry.
+                // apps stop seeing a dead camera entry.
                 unregisterVCam();
                 SetState(State::CameraMissing);
                 phase = Phase::Asleep;
@@ -807,8 +873,8 @@ void CaptureController::Run()
             }
             // The DLL publishes which format the active client negotiated; only
             // an MJPEG client needs the JFIF sidecar. mask==0 (no/stale client)
-            // -> wantJpeg=false. One plain aligned load + branch; the
-            // PS3 path always reports no jpeg and falls through to Publish().
+            // -> wantJpeg=false. One plain aligned load + branch; devices
+            // without a JPEG path report no jpeg and fall through to Publish().
             const bool wantJpeg =
                 (control.ConsumerMask() & controlbus::kConsumeMJPEG) != 0;
 
@@ -822,6 +888,17 @@ void CaptureController::Run()
             AcquiredFrame frame{};
             if (device->AcquireFrame(frame, 500, wantJpeg))
             {
+                if (frame.mode.width && (frame.mode.width != active.width ||
+                    frame.mode.height != active.height || frame.mode.fps != active.fps))
+                {
+                    active.width = frame.mode.width; active.height = frame.mode.height; active.fps = frame.mode.fps;
+                    bus.UpdateFormat(active.width, active.height, active.fps, 1);
+                    AcquireSRWLockExclusive(&_settingsLock);
+                    _active = active;
+                    ReleaseSRWLockExclusive(&_settingsLock);
+                    unregisterVCam();
+                    tryRegisterVCam();
+                }
                 consecutiveTimeouts = 0;
                 sawFrameSinceWake = true;   // a real frame: not a wedged session
                 ps4BarrenStreams = 0;
@@ -882,15 +959,31 @@ void CaptureController::Run()
 
             // A PS4 view switch (Left/Right/SBS) changes ProfileForSlot without a
             // Settings.width change, so the Asleep re-advertise path never runs
-            // while a client streams. The
-            // Settings dialog fires a device-change (RescanAllControllers) on a
-            // view switch; on that signal, re-check the profile and, if it differs,
+            // while a client streams. The Settings dialog fires a device-change
+            // (RescanAllControllers) on a view switch; on that signal, re-check
+            // the profile and, if it differs,
             // re-advertise + re-create the device live. Left<->Right keep the same
             // geometry (client continues); to/from SBS re-advertises (a client may
             // need to reopen). The auto-reset event keeps this off the hot path.
             if (WaitForSingleObject(_rescanEvent, 0) == WAIT_OBJECT_0)
             {
                 const DeviceProfile* prof = deviceregistry::ProfileForSlot(_cameraIndex);
+                const auto assignment = deviceregistry::QueryPs4Slot(_cameraIndex);
+                if (!prof || (deviceAssignment.isPs4 &&
+                    !deviceregistry::SamePs4DeviceRole(deviceAssignment, assignment)))
+                {
+                    releaseCamera();
+                    bus.PublishBlack();
+                    unregisterVCam();
+                    publishedProfile = nullptr;
+                    if (!prof) bus.WriteColdBlock(0, framebus::kFmtYUY2, nullptr, 0);
+                    // Asleep either way: that pass re-advertises the new occupant,
+                    // re-registers the virtual camera, and wakes straight back up
+                    // if a client is still fresh. Waking directly would stream with
+                    // no virtual camera until the hold ended.
+                    phase = Phase::Asleep;
+                    break;
+                }
                 if (prof && prof != publishedProfile)
                 {
                     // Prefer a LIVE view switch (PS4 Left/Right/SBS): the device
@@ -944,7 +1037,7 @@ void CaptureController::Run()
             // immediately afterwards with the new format).
             const bool previewOnlyModeChange =
                 _pendingMode.load(std::memory_order_relaxed) &&
-                IsPreviewOnly();
+                IsPreviewOnly() && !sharedExternalClient();
 
             if (previewOnlyModeChange || !clientFresh())
             {
@@ -954,15 +1047,14 @@ void CaptureController::Run()
                 else
                     HostLog(L"camera %d: no clients for %ums and preview closed -- going to sleep",
                             _cameraIndex, active.idleTimeoutMs);
-                // Tear the audio side down BEFORE the camera goes: the pump is
-                // the only thing that ever stops the renderer, and it only runs
-                // while streaming. Without this the render thread survives the
-                // sleep with nothing feeding it -- it starves on every callback
-                // (1,440 underruns in one measured 14 s sleep) and keeps the
-                // user's output device open while idle, which AudioRender.h
-                // exists partly to avoid. Passing nullptr is the same "no audio
-                // any more" path a camera without a microphone takes.
-                pumpMicrophone(nullptr);
+                // releaseCamera() tears the audio side down BEFORE the camera
+                // goes: the pump is the only thing that ever stops the renderer,
+                // and it only runs while streaming. Without that the render
+                // thread survives the sleep with nothing feeding it -- it starves
+                // on every callback (measured: 1,440 underruns in a 14 s sleep)
+                // and keeps the user's output device open while idle. It pumps
+                // with a null device, the same "no audio any more" path a camera
+                // without a microphone takes.
                 releaseCamera();
                 bus.PublishBlack();
                 applyPendingMode();
@@ -984,10 +1076,9 @@ void CaptureController::Run()
     HostLog(L"camera %d thread exited", _cameraIndex);
 }
 
-
 // ---------------------------------------------------------------------------
 // Microphone accessors. Called on the UI thread; everything here is either an
-// atomic or written before the flag the camera thread acquires.
+// atomic or goes through RecordingCommands' lock.
 // ---------------------------------------------------------------------------
 
 void CaptureController::MicLevels(float* out, uint32_t count) const
@@ -1001,20 +1092,14 @@ std::wstring CaptureController::MicStartRecording()
     if (_micChannels.load(std::memory_order_relaxed) == 0)
         return std::wstring();
 
-    wchar_t dir[MAX_PATH] = L"";
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_MYVIDEO, nullptr, 0, dir)))
-        GetTempPathW(MAX_PATH, dir);
-
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    wchar_t path[MAX_PATH];
-    swprintf_s(path, L"%s\\PSCam4Win-mic-%04u%02u%02u-%02u%02u%02u.wav",
-               dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-    // Path BEFORE the flag: the camera thread reads it only after it observes
-    // _micRecording, and the release/acquire pair orders the two writes.
-    _micRecPath = path;
+    PWSTR folder = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Videos, 0, nullptr, &folder))) return {};
+    std::wstring path = folder;
+    CoTaskMemFree(folder);
+    GUID id{}; wchar_t text[40]{};
+    if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(id, text, _countof(text))) return {};
+    path += L"\\PSCam4Win-mic-slot" + std::to_wstring(_cameraIndex) + L"-" + text + L".wav";
     _micRecSecs.store(0, std::memory_order_relaxed);
-    _micRecording.store(true, std::memory_order_release);
-    return _micRecPath;
+    _recording.Start(path);
+    return path;
 }

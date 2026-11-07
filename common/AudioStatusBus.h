@@ -6,25 +6,32 @@
 // Exposes in-process microphone health and the renderer's ring fill and drift
 // correction to external readers without putting audio samples on the bus.
 //
-// Deliberately ONE block, not one per slot: there is a single microphone array
-// and a single renderer, so a per-slot name would imply a fan-out that does not
-// exist. `slot` says which camera it belongs to.
+// Each microphone-owning slot publishes its own block (Name(slot)); a split
+// pair's Right half reads its home slot's. Diagnostic tools that do not know
+// the slot use Reader::OpenAny(), which also accepts the unsuffixed block an
+// older tray publishes.
 //
-// Published at 10 Hz from the capture thread, read by anyone. There is no
+// Published at 10 Hz from the capture thread while the camera streams, read by
+// anyone. There is no
 // lock: every field is either atomic-width or only meaningful alongside `seq`,
 // which is bumped after the payload is written. A reader that wants a coherent
 // snapshot reads seq, copies, reads seq again, and retries if it moved —
 // the same seqlock discipline FrameBus uses.
 //
 #include <windows.h>
+#include <sddl.h>
 #include <cstddef>   // offsetof, for the payload-only publish below
 #include <cstdint>
+#include <string>
+#include "VCamGuids.h"   // kVCamCount
 
 namespace audiostatus {
 
 constexpr uint32_t kMagic   = 0x53344153;   // 'S4AS'
 constexpr uint32_t kVersion = 1;
 constexpr wchar_t  kName[]  = L"Global\\PSCam4Win.AudioStatus";
+inline std::wstring Name(int slot)
+{ return slot < 0 ? kName : std::wstring(kName) + L"." + std::to_wstring(slot); }
 
 struct Block
 {
@@ -51,17 +58,15 @@ struct Block
     wchar_t  endpointName[128];
 
     // GetTickCount64() at the last Publish. WITHOUT THIS THE BLOCK LIES: it is
-    // written once per captured frame, so when the camera sleeps the last
+    // written only while the camera streams, so when the camera sleeps the last
     // snapshot simply stays there, and "4 ch, rendering at 48000 Hz" reads
     // identically whether that is happening now or stopped ten minutes ago.
-    // That cost a real debugging session -- a keep-awake test looked broken
-    // because the stale block still said channels=4 after the camera slept.
     uint64_t publishTick;
 };
 
 // How old a snapshot may be and still describe the present. The writer publishes
-// per video frame (60/s at the usual mode, 15/s at the slowest), so anything
-// past a second means the pump has stopped -- the camera slept, or the tray died.
+// every 100 ms while streaming, so anything past a second means the pump has
+// stopped -- the camera slept, or the tray died.
 constexpr uint64_t kFreshMs = 1500;
 
 // Writer: the tray. Creates the block and publishes into it.
@@ -70,12 +75,20 @@ class Writer
 public:
     ~Writer() { Close(); }
 
-    bool Create()
+    bool Create(int slot = -1)
     {
         if (_view) return true;
-        _map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                  0, sizeof(Block), kName);
-        if (!_map) return false;
+        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, FALSE };
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;LS)(A;;GR;;;WD)(A;;GR;;;AC)",
+                SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr)) return false;
+        _map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
+                                  0, sizeof(Block), Name(slot).c_str());
+        // CreateFileMapping reuses a surviving named section without applying
+        // the supplied descriptor, so apply it explicitly.
+        const bool secured = _map && SetKernelObjectSecurity(_map, DACL_SECURITY_INFORMATION, sa.lpSecurityDescriptor);
+        LocalFree(sa.lpSecurityDescriptor);
+        if (!secured) { Close(); return false; }
         _view = (Block*)MapViewOfFile(_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Block));
         if (!_view) { CloseHandle(_map); _map = nullptr; return false; }
         _view->magic = kMagic;
@@ -101,11 +114,11 @@ public:
         _view->seq = odd;
         MemoryBarrier();
 
-        // Copy the PAYLOAD ONLY, never `seq`. A whole-struct memcpy wrote the
-        // caller's zero-initialised seq over the live one, so for the length of
-        // the copy the block read EVEN -- the value that means "consistent" --
-        // and a reader could take a torn snapshot and believe it. The seqlock
-        // was silently not a seqlock. Everything from `slot` onward is payload.
+        // Copy the PAYLOAD ONLY, never `seq`. A whole-struct memcpy would write
+        // the caller's zero-initialised seq over the live one, so for the length
+        // of the copy the block would read EVEN -- the value that means
+        // "consistent" -- and a reader could take a torn snapshot and believe
+        // it. Everything from `slot` onward is payload.
         memcpy((void*)&_view->slot, &b.slot, sizeof(Block) - offsetof(Block, slot));
         _view->magic = kMagic;
         _view->version = kVersion;
@@ -120,20 +133,37 @@ private:
     Block* _view = nullptr;
 };
 
-// Reader: the suite, mic_route, anything diagnostic.
+// Reader: the Settings window and any diagnostic tool.
 class Reader
 {
 public:
     ~Reader() { Close(); }
 
-    bool Open()
+    bool Open(int slot = -1)
     {
-        if (_view) return true;
-        _map = OpenFileMappingW(FILE_MAP_READ, FALSE, kName);
+        if (_view && _slot == slot) return true;
+        Close(); _slot = slot;
+        _map = OpenFileMappingW(FILE_MAP_READ, FALSE, Name(slot).c_str());
         if (!_map) return false;
         _view = (const Block*)MapViewOfFile(_map, FILE_MAP_READ, 0, 0, sizeof(Block));
         if (!_view) { CloseHandle(_map); _map = nullptr; return false; }
         return true;
+    }
+
+    // Diagnostic selection: prefer a fresh per-slot writer, while permitting
+    // the unsuffixed mapping produced by an older installed tray.
+    bool OpenAny()
+    {
+        Block b{};
+        int fallback = -1;
+        for (int slot = 0; slot < kVCamCount; ++slot)
+            if (Open(slot) && Read(b))
+            {
+                if (Fresh(b) && b.channels) return true;
+                if (fallback < 0) fallback = slot;
+            }
+        if (Open() && Read(b)) return true;
+        return fallback >= 0 && Open(fallback);
     }
 
     void Close()
@@ -150,7 +180,7 @@ public:
         for (int attempt = 0; attempt < 8; ++attempt)
         {
             const uint64_t a = _view->seq;
-            if (a & 1) { Sleep(0); continue; }         // mid-write
+            if (a & 1) { YieldProcessor(); continue; }         // mid-write
             MemoryBarrier();
             memcpy(&out, (const void*)_view, sizeof(Block));
             MemoryBarrier();
@@ -173,6 +203,7 @@ public:
 private:
     HANDLE _map = nullptr;
     const Block* _view = nullptr;
+    int _slot = -1;
 };
 
 } // namespace audiostatus

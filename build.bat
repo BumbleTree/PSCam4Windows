@@ -5,8 +5,8 @@ rem PSCam4Win-Setup.exe (GUI installer with the payload embedded as resources)
 rem with VS2019 Build Tools. Static CRT (/MT) matches the prebuilt libusb.
 rem
 rem   build.bat            full build (all three artifacts)
-rem   build.bat installer  re-embed + relink ONLY the setup exe (used by CI to
-rem                        rebuild the installer around signed payload binaries)
+rem   build.bat installer  re-embed + relink ONLY the setup exe, e.g. after
+rem                        replacing the payload binaries with signed copies
 rem
 rem PSCAM_SIGN_CMD (optional): a command invoked as  %PSCAM_SIGN_CMD% "<file>"
 rem after each binary links, for local Authenticode signing setups.
@@ -84,7 +84,6 @@ rem at it. VENDORFLAGS drops back to /W3 for third_party\ps3eye only: warnings i
 rem code we do not author are noise we cannot act on without diverging upstream.
 set CFLAGS=/nologo /c /O2 /MT /EHsc /std:c++17 /utf-8 /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
 set VENDORFLAGS=%CFLAGS:/W4=/W3%
-if "%PSCAM_PUBLIC_RELEASE%"=="1" set CFLAGS=%CFLAGS% /DPSCAM_PUBLIC_RELEASE
 
 if /i "%BUILD_MODE%"=="installer" goto installer_phase
 
@@ -100,7 +99,7 @@ if errorlevel 1 exit /b 1
 
 link /nologo /DLL /DEF:"%ROOT%source\PSCam4Win.def" /OUT:"%OUT%\PSCam4Win.dll" ^
     "%OUT%\VCamSource.obj" "%OUT%\dllmain.obj" ^
-    mfplat.lib mfuuid.lib ole32.lib advapi32.lib
+    %TJPEG_LIB% mfplat.lib mfuuid.lib ole32.lib advapi32.lib
 if errorlevel 1 exit /b 1
 if defined PSCAM_SIGN_CMD call %PSCAM_SIGN_CMD% "%OUT%\PSCam4Win.dll"
 

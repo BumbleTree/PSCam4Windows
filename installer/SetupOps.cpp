@@ -17,6 +17,8 @@
 #endif
 
 #include <vector>
+#include <algorithm>
+#include <cwctype>
 
 #include "SetupLog.h"
 #include "..\common\VCamGuids.h"
@@ -237,24 +239,58 @@ bool ReadArpInstallState(InstallState& out)
         return false;
 
     out.installed = true;
-    auto readString = [key](const wchar_t* name) -> std::wstring {
+    {
         wchar_t buf[512] = {};
         DWORD size = sizeof(buf);
         DWORD type = 0;
-        if (RegQueryValueExW(key, name, nullptr, &type,
+        if (RegQueryValueExW(key, L"DisplayVersion", nullptr, &type,
                              reinterpret_cast<BYTE*>(buf), &size) == ERROR_SUCCESS &&
             type == REG_SZ)
         {
             buf[_countof(buf) - 1] = L'\0';
-            return buf;
+            out.displayVersion = buf;
         }
-        return std::wstring();
-    };
-    out.displayVersion = readString(L"DisplayVersion");
-    out.installLocation = readString(L"InstallLocation");
-    out.oemInf[0] = readString(L"PnpOem_usb_device");
-    out.oemInf[1] = readString(L"PnpOem_eyetoy_device");
-    out.oemInf[2] = readString(L"PnpOem_ps4cam_device");
+    }
+    {
+        DWORD tracked = 0, bytes = sizeof(tracked), type = 0;
+        out.certOwnershipTracked =
+            RegQueryValueExW(key, L"CertOwnershipTracked", nullptr, &type,
+                             reinterpret_cast<BYTE*>(&tracked), &bytes) == ERROR_SUCCESS &&
+            type == REG_DWORD && tracked != 0;
+    }
+    constexpr wchar_t prefix[] = L"OwnedCertificate_";
+    for (DWORD index = 0;; ++index)
+    {
+        wchar_t name[256]{};
+        DWORD nameChars = _countof(name), type = 0, flags = 0, bytes = sizeof(flags);
+        const LSTATUS status = RegEnumValueW(key, index, name, &nameChars, nullptr,
+                                             &type, reinterpret_cast<BYTE*>(&flags), &bytes);
+        if (status == ERROR_NO_MORE_ITEMS)
+            break;
+        if (status != ERROR_SUCCESS || type != REG_DWORD || bytes != sizeof(flags) ||
+            !flags || (flags & ~3u) || nameChars != _countof(prefix) - 1 + 40 ||
+            _wcsnicmp(name, prefix, _countof(prefix) - 1) != 0)
+            continue;
+        CertRecord rec{};
+        bool valid = true;
+        auto nibble = [](wchar_t c) -> int {
+            if (c >= L'0' && c <= L'9') return c - L'0';
+            if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+            if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+            return -1;
+        };
+        for (size_t i = 0; i < 20; ++i)
+        {
+            const int hi = nibble(name[_countof(prefix) - 1 + 2 * i]);
+            const int lo = nibble(name[_countof(prefix) + 2 * i]);
+            if (hi < 0 || lo < 0) { valid = false; break; }
+            rec.thumbprint[i] = static_cast<BYTE>((hi << 4) | lo);
+        }
+        rec.addedToRoot = (flags & 1) != 0;
+        rec.addedToTrustedPub = (flags & 2) != 0;
+        if (valid)
+            out.ownedCertificates.push_back(rec);
+    }
     RegCloseKey(key);
     return true;
 }
@@ -423,61 +459,47 @@ bool ThumbprintOfCertBytes(const BYTE* der, DWORD len, BYTE out[20])
     return ok && size == 20;
 }
 
-bool ThumbprintOfCertFile(const std::wstring& path, BYTE out[20])
-{
-    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
-        return false;
-    const DWORD size = GetFileSize(file, nullptr);
-    bool ok = false;
-    if (size > 0 && size < 1024 * 1024)
-    {
-        std::vector<BYTE> bytes(size);
-        DWORD read = 0;
-        if (ReadFile(file, bytes.data(), size, &read, nullptr) && read == size)
-            ok = ThumbprintOfCertBytes(bytes.data(), size, out);
-    }
-    CloseHandle(file);
-    return ok;
-}
-
 namespace
 {
 
-HCERTSTORE OpenSystemStore(const wchar_t* name)
+// A LocalMachine system certificate store, closed on scope exit.
+class SystemStore
 {
-    return CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
-                         CERT_SYSTEM_STORE_LOCAL_MACHINE, name);
-}
+public:
+    explicit SystemStore(const wchar_t* name)
+        : _h(CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+                           CERT_SYSTEM_STORE_LOCAL_MACHINE, name)) {}
+    ~SystemStore() { if (_h) CertCloseStore(_h, 0); }
+    SystemStore(const SystemStore&) = delete;
+    SystemStore& operator=(const SystemStore&) = delete;
+    explicit operator bool() const { return _h != nullptr; }
+    HCERTSTORE Get() const { return _h; }
+private:
+    HCERTSTORE _h;
+};
 
-#ifndef PSCAM_PUBLIC_RELEASE
-bool StoreContainsThumbprint(HCERTSTORE store, const BYTE thumb[20])
+// The store's certificate with this SHA-1 thumbprint, or null. The caller
+// owns the returned context.
+PCCERT_CONTEXT FindByThumbprint(HCERTSTORE store, const BYTE thumb[20])
 {
     CRYPT_HASH_BLOB blob = { 20, const_cast<BYTE*>(thumb) };
-    PCCERT_CONTEXT found = CertFindCertificateInStore(
-        store, X509_ASN_ENCODING, 0, CERT_FIND_SHA1_HASH, &blob, nullptr);
-    if (found)
-    {
-        CertFreeCertificateContext(found);
-        return true;
-    }
-    return false;
+    return CertFindCertificateInStore(store, X509_ASN_ENCODING, 0, CERT_FIND_SHA1_HASH,
+                                      &blob, nullptr);
 }
-#endif
+
+bool StoreContainsThumbprint(HCERTSTORE store, const BYTE thumb[20])
+{
+    PCCERT_CONTEXT found = FindByThumbprint(store, thumb);
+    if (!found)
+        return false;
+    CertFreeCertificateContext(found);
+    return true;
+}
 
 } // namespace
 
 bool AddCertToSystemStores(const BYTE* der, DWORD len, CertRecord& rec, Logger& log)
 {
-#ifdef PSCAM_PUBLIC_RELEASE
-    // Public packages rely on Windows certificate policy, never installer-added trust.
-    (void)der;
-    (void)len;
-    (void)rec;
-    log.Line(L"Public release: certificate stores are left unchanged");
-    return true;
-#else
     if (!ThumbprintOfCertBytes(der, len, rec.thumbprint))
     {
         log.Line(L"error: embedded certificate is not a valid X.509 blob");
@@ -491,19 +513,18 @@ bool AddCertToSystemStores(const BYTE* der, DWORD len, CertRecord& rec, Logger& 
 
     for (const auto& target : kStores)
     {
-        const HCERTSTORE store = OpenSystemStore(target.store);
+        const SystemStore store(target.store);
         if (!store)
         {
             log.Line(L"error: cannot open the LocalMachine %s store (code %lu)",
                      target.store, GetLastError());
             return false;
         }
-        bool ok = true;
-        if (StoreContainsThumbprint(store, rec.thumbprint))
+        if (StoreContainsThumbprint(store.Get(), rec.thumbprint))
         {
             log.Line(L"certificate already present in %s -- leaving it in place", target.store);
         }
-        else if (CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING, der, len,
+        else if (CertAddEncodedCertificateToStore(store.Get(), X509_ASN_ENCODING, der, len,
                                                   CERT_STORE_ADD_REPLACE_EXISTING, nullptr))
         {
             rec.*(target.added) = true;
@@ -513,14 +534,10 @@ bool AddCertToSystemStores(const BYTE* der, DWORD len, CertRecord& rec, Logger& 
         {
             log.Line(L"error: could not add the certificate to %s (code %lu)",
                      target.store, GetLastError());
-            ok = false;
-        }
-        CertCloseStore(store, 0);
-        if (!ok)
             return false;
+        }
     }
     return true;
-#endif
 }
 
 bool RemoveCertByThumbprint(const BYTE thumb[20], bool fromRoot, bool fromTrustedPub, Logger& log)
@@ -534,16 +551,13 @@ bool RemoveCertByThumbprint(const BYTE thumb[20], bool fromRoot, bool fromTruste
     {
         if (!target.enabled)
             continue;
-        const HCERTSTORE store = OpenSystemStore(target.store);
+        const SystemStore store(target.store);
         if (!store)
         {
             allOk = false;
             continue;
         }
-        CRYPT_HASH_BLOB blob = { 20, const_cast<BYTE*>(thumb) };
-        PCCERT_CONTEXT found = CertFindCertificateInStore(
-            store, X509_ASN_ENCODING, 0, CERT_FIND_SHA1_HASH, &blob, nullptr);
-        if (found)
+        if (PCCERT_CONTEXT found = FindByThumbprint(store.Get(), thumb))
         {
             if (CertDeleteCertificateFromStore(found))   // consumes `found`
                 log.Line(L"certificate removed from LocalMachine\\%s", target.store);
@@ -554,102 +568,156 @@ bool RemoveCertByThumbprint(const BYTE thumb[20], bool fromRoot, bool fromTruste
                 allOk = false;
             }
         }
-        CertCloseStore(store, 0);
     }
     return allOk;
 }
 
+DWORD CertStorePresence(const BYTE thumb[20])
+{
+    constexpr const wchar_t* kStores[] = { L"Root", L"TrustedPublisher" };
+    DWORD presence = 0;
+    for (DWORD i = 0; i < 2; ++i)
+    {
+        const SystemStore store(kStores[i]);
+        if (store && StoreContainsThumbprint(store.Get(), thumb))
+            presence |= 1u << i;
+    }
+    return presence;
+}
+
+std::wstring CertificateOwnershipName(const BYTE thumb[20])
+{
+    std::wstring name = L"OwnedCertificate_";
+    constexpr wchar_t digits[] = L"0123456789abcdef";
+    for (size_t i = 0; i < 20; ++i)
+    {
+        name += digits[thumb[i] >> 4];
+        name += digits[thumb[i] & 15];
+    }
+    return name;
+}
+
 // ---- drivers --------------------------------------------------------------------
 
-DWORD RunPnputil(const std::wstring& args, std::wstring& output, Logger& log)
+DWORD RunProcessCaptured(const std::wstring& exe, const std::wstring& args,
+                         std::wstring& output, Logger& log,
+                         std::atomic<bool>* cancel, DWORD timeoutMs)
 {
     output.clear();
-
-    wchar_t sysDir[MAX_PATH] = {};
-    GetSystemDirectoryW(sysDir, _countof(sysDir));
-    const std::wstring exe = std::wstring(sysDir) + L"\\pnputil.exe";
-
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
     HANDLE readPipe = nullptr, writePipe = nullptr;
     if (!CreatePipe(&readPipe, &writePipe, &sa, 0))
-        return static_cast<DWORD>(-1);
+        return GetLastError();
     SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-
-    std::wstring cmdLine = L"\"" + exe + L"\" " + args;
-    STARTUPINFOW si = { sizeof(si) };
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                         &limits, sizeof(limits)))
+    {
+        const DWORD error = GetLastError();
+        if (job) CloseHandle(job);
+        CloseHandle(readPipe); CloseHandle(writePipe);
+        return error;
+    }
+    std::wstring command = L"\"" + exe + L"\" " + args;
+    STARTUPINFOW si{ sizeof(si) };
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = writePipe;
-    si.hStdError = writePipe;
+    si.hStdOutput = si.hStdError = writePipe;
     si.hStdInput = INVALID_HANDLE_VALUE;
-    PROCESS_INFORMATION pi = {};
-
-    const BOOL launched = CreateProcessW(exe.c_str(), cmdLine.data(), nullptr, nullptr,
-                                         TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    PROCESS_INFORMATION pi{};
+    const BOOL launched = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE,
+                                          CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                                          nullptr, nullptr, &si, &pi);
     CloseHandle(writePipe);
     if (!launched)
     {
-        const DWORD code = GetLastError();
-        CloseHandle(readPipe);
-        log.Line(L"error: cannot launch pnputil.exe (code %lu)", code);
-        return static_cast<DWORD>(-1);
+        const DWORD error = GetLastError();
+        CloseHandle(readPipe); CloseHandle(job);
+        log.Line(L"error: cannot launch %s (code %lu)", exe.c_str(), error);
+        return error;
+    }
+    DWORD forcedResult = ERROR_SUCCESS;
+    if (!AssignProcessToJobObject(job, pi.hProcess) || ResumeThread(pi.hThread) == static_cast<DWORD>(-1))
+    {
+        forcedResult = GetLastError();
+        TerminateProcess(pi.hProcess, forcedResult);
+        WaitForSingleObject(pi.hProcess, INFINITE);
     }
 
     std::vector<char> raw;
-    char chunk[4096];
-    DWORD read = 0;
-    while (ReadFile(readPipe, chunk, sizeof(chunk), &read, nullptr) && read > 0)
-        raw.insert(raw.end(), chunk, chunk + read);
-    CloseHandle(readPipe);
-
-    WaitForSingleObject(pi.hProcess, 120000);
-    DWORD exitCode = static_cast<DWORD>(-1);
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-
-    // pnputil output is UTF-16LE when it starts with a BOM, OEM code page otherwise.
-    if (raw.size() >= 2 && static_cast<BYTE>(raw[0]) == 0xFF && static_cast<BYTE>(raw[1]) == 0xFE)
+    constexpr size_t maxOutput = 1024 * 1024;
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    bool pipeOpen = true;
+    for (; forcedResult == ERROR_SUCCESS; )
     {
+        DWORD avail = 0;
+        if (pipeOpen && !PeekNamedPipe(readPipe, nullptr, 0, nullptr, &avail, nullptr))
+            pipeOpen = false;
+        if (pipeOpen && avail)
+        {
+            char chunk[4096];
+            DWORD read = 0;
+            if (ReadFile(readPipe, chunk, (std::min)(avail, static_cast<DWORD>(sizeof(chunk))),
+                         &read, nullptr) && read)
+            {
+                const size_t keep = (std::min)(static_cast<size_t>(read), maxOutput - raw.size());
+                raw.insert(raw.end(), chunk, chunk + keep);
+            }
+            else
+                pipeOpen = false;
+        }
+        const DWORD wait = WaitForSingleObject(pi.hProcess, 0);
+        if (wait == WAIT_OBJECT_0 && (!pipeOpen || !avail))
+            break;
+        if (wait == WAIT_FAILED)
+            forcedResult = GetLastError();
+        else if (cancel && cancel->load())
+            forcedResult = ERROR_CANCELLED;
+        else if (GetTickCount64() >= deadline)
+            forcedResult = ERROR_TIMEOUT;
+        if (forcedResult != ERROR_SUCCESS)
+        {
+            log.Line(L"stopping %s (code %lu)", exe.c_str(), forcedResult);
+            TerminateJobObject(job, forcedResult);
+            // Rollback must not race a child that is still changing system state.
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            break;
+        }
+        if (!avail)
+            WaitForSingleObject(pi.hProcess, 20);
+    }
+    DWORD exitCode = forcedResult;
+    if (exitCode == ERROR_SUCCESS && !GetExitCodeProcess(pi.hProcess, &exitCode))
+        exitCode = GetLastError();
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    CloseHandle(job); CloseHandle(readPipe);
+
+    if (raw.size() >= 2 && static_cast<BYTE>(raw[0]) == 0xFF && static_cast<BYTE>(raw[1]) == 0xFE)
         output.assign(reinterpret_cast<const wchar_t*>(raw.data() + 2),
                       (raw.size() - 2) / sizeof(wchar_t));
-    }
     else if (!raw.empty())
     {
-        const int wideLen = MultiByteToWideChar(CP_OEMCP, 0, raw.data(),
-                                                static_cast<int>(raw.size()), nullptr, 0);
-        output.resize(static_cast<size_t>(wideLen));
-        MultiByteToWideChar(CP_OEMCP, 0, raw.data(), static_cast<int>(raw.size()),
-                            output.data(), wideLen);
+        const int chars = MultiByteToWideChar(CP_OEMCP, 0, raw.data(),
+                                              static_cast<int>(raw.size()), nullptr, 0);
+        if (chars > 0)
+        {
+            output.resize(static_cast<size_t>(chars));
+            MultiByteToWideChar(CP_OEMCP, 0, raw.data(), static_cast<int>(raw.size()),
+                                output.data(), chars);
+        }
     }
-    while (!output.empty() && (output.back() == L'\r' || output.back() == L'\n' ||
-                               output.back() == L' '))
-        output.pop_back();
     return exitCode;
 }
 
-// Does this published INF declare the device-interface GUID we ship for the
-// camera? Read through setupapi rather than by scanning the text, so INF quoting
-// and the file's encoding are somebody else's problem.
-static bool InfDeclaresInterfaceGuid(const std::wstring& infPath, const GUID& want)
+DWORD RunPnputil(const std::wstring& args, std::wstring& output, Logger& log,
+                 std::atomic<bool>* cancel)
 {
-    wchar_t wanted[64] = {};
-    if (StringFromGUID2(want, wanted, _countof(wanted)) == 0)
-        return false;
-
-    const HINF inf = SetupOpenInfFileW(infPath.c_str(), nullptr, INF_STYLE_WIN4, nullptr);
-    if (inf == INVALID_HANDLE_VALUE)
-        return false;
-
-    bool match = false;
-    INFCONTEXT ctx = {};
-    if (SetupFindFirstLineW(inf, L"Strings", L"DeviceGUID", &ctx))
-    {
-        wchar_t got[64] = {};
-        if (SetupGetStringFieldW(&ctx, 1, got, _countof(got), nullptr))
-            match = _wcsicmp(got, wanted) == 0;
-    }
-    SetupCloseInfFile(inf);
-    return match;
+    wchar_t sysDir[MAX_PATH]{};
+    if (!GetSystemDirectoryW(sysDir, _countof(sysDir)))
+        return GetLastError();
+    return RunProcessCaptured(std::wstring(sysDir) + L"\\pnputil.exe", args,
+                              output, log, cancel, 120000);
 }
 
 bool PublishedNameFromPnputilOutput(const std::wstring& output, std::wstring& oemName)
@@ -659,6 +727,8 @@ bool PublishedNameFromPnputilOutput(const std::wstring& output, std::wstring& oe
     {
         if (_wcsnicmp(output.c_str() + i, L"oem", 3) != 0)
             continue;
+        if (i && (std::iswalnum(output[i - 1]) || output[i - 1] == L'_'))
+            continue;
         size_t j = i + 3;
         while (j < output.size() && output[j] >= L'0' && output[j] <= L'9')
             ++j;
@@ -666,48 +736,177 @@ bool PublishedNameFromPnputilOutput(const std::wstring& output, std::wstring& oe
             continue;                                   // "oem" with no number
         if (_wcsnicmp(output.c_str() + j, L".inf", 4) != 0)
             continue;
-        oemName.assign(output, i, (j + 4) - i);
-        return true;
+        if (j + 4 < output.size() && (std::iswalnum(output[j + 4]) ||
+            output[j + 4] == L'_' || output[j + 4] == L'.'))
+            continue;
+        const std::wstring candidate = output.substr(i, (j + 4) - i);
+        if (!oemName.empty() && _wcsicmp(candidate.c_str(), oemName.c_str()) != 0)
+        {
+            oemName.clear();
+            return false;
+        }
+        oemName = candidate;
+        i = j + 3;
     }
-    return false;
+    return !oemName.empty();
 }
 
-bool FindPublishedInfName(const wchar_t* originalLeafName, const GUID& interfaceGuid,
-                          std::wstring& oemName)
+namespace
 {
-    oemName.clear();
 
-    wchar_t winDir[MAX_PATH] = {};
+// An INF opened through SetupAPI, closed on scope exit.
+class InfFile
+{
+public:
+    explicit InfFile(const std::wstring& path)
+        : _h(SetupOpenInfFileW(path.c_str(), nullptr, INF_STYLE_WIN4, nullptr)) {}
+    ~InfFile() { if (_h != INVALID_HANDLE_VALUE) SetupCloseInfFile(_h); }
+    InfFile(const InfFile&) = delete;
+    InfFile& operator=(const InfFile&) = delete;
+    explicit operator bool() const { return _h != INVALID_HANDLE_VALUE; }
+    HINF Get() const { return _h; }
+private:
+    HINF _h;
+};
+
+// The first field of `key` in [section] equals `expected` (case-insensitive).
+// Read through SetupAPI rather than by scanning the text, so INF quoting and
+// the file's encoding (ANSI or UTF-16) are somebody else's problem.
+bool InfStringIs(const std::wstring& infPath, const wchar_t* section, const wchar_t* key,
+                 const wchar_t* expected)
+{
+    const InfFile inf(infPath);
+    if (!inf)
+        return false;
+    INFCONTEXT ctx = {};
+    wchar_t got[256] = {};
+    return SetupFindFirstLineW(inf.Get(), section, key, &ctx) &&
+           SetupGetStringFieldW(&ctx, 1, got, _countof(got), nullptr) &&
+           _wcsicmp(got, expected) == 0;
+}
+
+// Does this INF declare the device-interface GUID we ship for the camera?
+bool InfDeclaresInterfaceGuid(const std::wstring& infPath, const GUID& want)
+{
+    wchar_t wanted[64] = {};
+    return StringFromGUID2(want, wanted, _countof(wanted)) != 0 &&
+           InfStringIs(infPath, L"Strings", L"DeviceGUID", wanted);
+}
+
+bool IsPublishedName(const std::wstring& name)
+{
+    if (name.size() < 8 || _wcsnicmp(name.c_str(), L"oem", 3) != 0 ||
+        _wcsicmp(name.c_str() + name.size() - 4, L".inf") != 0)
+        return false;
+    for (size_t i = 3; i < name.size() - 4; ++i)
+        if (name[i] < L'0' || name[i] > L'9')
+            return false;
+    return true;
+}
+
+// %WINDIR%\INF\<oemName>, or "" when `oemName` is not a bare oemNN.inf leaf.
+std::wstring PublishedInfPath(const std::wstring& oemName)
+{
+    if (!IsPublishedName(oemName))
+        return std::wstring();
+    wchar_t winDir[MAX_PATH]{};
+    if (!GetWindowsDirectoryW(winDir, _countof(winDir)))
+        return std::wstring();
+    return std::wstring(winDir) + L"\\INF\\" + oemName;
+}
+
+// The published INF's original name, as kept in the driver store, is `leaf`.
+bool DriverStoreLeafIs(const std::wstring& publishedPath, const wchar_t* leaf)
+{
+    wchar_t storePath[MAX_PATH * 2]{};
+    if (!SetupGetInfDriverStoreLocationW(publishedPath.c_str(), nullptr, nullptr, storePath,
+                                         _countof(storePath), nullptr))
+        return false;
+    const wchar_t* storeLeaf = wcsrchr(storePath, L'\\');
+    storeLeaf = storeLeaf ? storeLeaf + 1 : storePath;
+    return _wcsicmp(storeLeaf, leaf) == 0;
+}
+
+bool SameFileBytes(const std::wstring& a, const std::wstring& b)
+{
+    auto read = [](const std::wstring& path, std::vector<BYTE>& bytes) {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return false;
+        LARGE_INTEGER size{};
+        bool ok = GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= 1024 * 1024;
+        if (ok)
+        {
+            bytes.resize(static_cast<size_t>(size.QuadPart));
+            DWORD got = 0;
+            ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr) &&
+                 got == bytes.size();
+        }
+        CloseHandle(file);
+        return ok;
+    };
+    std::vector<BYTE> left, right;
+    return read(a, left) && read(b, right) && left == right;
+}
+
+// Every %WINDIR%\INF\oem*.inf leaf name for which `match` holds.
+template <class Match>
+bool EnumeratePublishedInfs(Match match, std::vector<std::wstring>& names)
+{
+    names.clear();
+    wchar_t winDir[MAX_PATH]{};
     if (!GetWindowsDirectoryW(winDir, _countof(winDir)))
         return false;
-    const std::wstring infDir = std::wstring(winDir) + L"\\INF";
-
-    WIN32_FIND_DATAW find = {};
-    const HANDLE search = FindFirstFileW((infDir + L"\\oem*.inf").c_str(), &find);
+    const std::wstring pattern = std::wstring(winDir) + L"\\INF\\oem*.inf";
+    WIN32_FIND_DATAW find{};
+    const HANDLE search = FindFirstFileW(pattern.c_str(), &find);
     if (search == INVALID_HANDLE_VALUE)
-        return false;
-
-    bool found = false;
+        return GetLastError() == ERROR_FILE_NOT_FOUND;
     do
     {
-        const std::wstring oemPath = infDir + L"\\" + find.cFileName;
-        wchar_t storePath[MAX_PATH * 2] = {};
-        DWORD required = 0;
-        if (!SetupGetInfDriverStoreLocationW(oemPath.c_str(), nullptr, nullptr,
-                                             storePath, _countof(storePath), &required))
-            continue;
-        const wchar_t* leaf = wcsrchr(storePath, L'\\');
-        leaf = leaf ? leaf + 1 : storePath;
-        if (_wcsicmp(leaf, originalLeafName) == 0 &&
-            InfDeclaresInterfaceGuid(oemPath, interfaceGuid))
-        {
-            oemName = find.cFileName;
-            found = true;
-            break;
-        }
+        if (match(std::wstring(find.cFileName)))
+            names.emplace_back(find.cFileName);
     } while (FindNextFileW(search, &find));
+    const DWORD error = GetLastError();
     FindClose(search);
-    return found;
+    return error == ERROR_NO_MORE_FILES;
+}
+
+} // namespace
+
+bool InfDeviceIdIs(const std::wstring& infPath, const wchar_t* deviceId)
+{
+    return InfStringIs(infPath, L"Strings", L"DeviceID", deviceId);
+}
+
+bool PublishedInfMatches(const std::wstring& oemName, const wchar_t* originalLeafName,
+                         const GUID& interfaceGuid, const std::wstring* exactInf)
+{
+    const std::wstring path = PublishedInfPath(oemName);
+    return !path.empty() && DriverStoreLeafIs(path, originalLeafName) &&
+           InfDeclaresInterfaceGuid(path, interfaceGuid) &&
+           (!exactInf || SameFileBytes(path, *exactInf));
+}
+
+bool EnumeratePublishedInfNames(const wchar_t* originalLeafName, const GUID& interfaceGuid,
+                                std::vector<std::wstring>& names)
+{
+    return EnumeratePublishedInfs([&](const std::wstring& name) {
+        return PublishedInfMatches(name, originalLeafName, interfaceGuid);
+    }, names);
+}
+
+bool PublishedInfIsLegacyPs3Audio(const std::wstring& oemName)
+{
+    const std::wstring path = PublishedInfPath(oemName);
+    return !path.empty() && DriverStoreLeafIs(path, L"usb_audio.inf") &&
+           InfStringIs(path, L"Version", L"Provider", L"PS3EyeVCam");
+}
+
+bool EnumerateLegacyPs3AudioInfNames(std::vector<std::wstring>& names)
+{
+    return EnumeratePublishedInfs(PublishedInfIsLegacyPs3Audio, names);
 }
 
 // ---- scheduled tasks ----------------------------------------------------------------
@@ -768,35 +967,177 @@ LSTATUS CopyRegTree(HKEY root, const wchar_t* srcPath, const wchar_t* dstPath)
     return status;
 }
 
+namespace
+{
+LSTATUS SnapshotKey(HKEY key, const std::wstring& path, RegistryTree& snapshot, unsigned depth)
+{
+    if (depth > 64)
+        return ERROR_BAD_PATHNAME;
+    DWORD maxSub = 0, maxName = 0, maxData = 0;
+    LSTATUS status = RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, nullptr, &maxSub,
+                                     nullptr, nullptr, &maxName, &maxData, nullptr, nullptr);
+    if (status != ERROR_SUCCESS)
+        return status;
+    RegistryTree::Key record;
+    record.path = path;
+    std::vector<wchar_t> name(static_cast<size_t>(maxName) + 2);
+    std::vector<BYTE> data(static_cast<size_t>(maxData) + 1);
+    for (DWORD index = 0;; ++index)
+    {
+        DWORD chars = static_cast<DWORD>(name.size()), bytes = static_cast<DWORD>(data.size()), type = 0;
+        status = RegEnumValueW(key, index, name.data(), &chars, nullptr, &type, data.data(), &bytes);
+        if (status == ERROR_NO_MORE_ITEMS)
+            break;
+        if (status != ERROR_SUCCESS)
+            return status;
+        record.values.push_back({ std::wstring(name.data(), chars), type,
+                                  std::vector<BYTE>(data.begin(), data.begin() + bytes) });
+    }
+    snapshot.keys.push_back(std::move(record));
+    name.resize(static_cast<size_t>(maxSub) + 2);
+    for (DWORD index = 0;; ++index)
+    {
+        DWORD chars = static_cast<DWORD>(name.size());
+        status = RegEnumKeyExW(key, index, name.data(), &chars, nullptr, nullptr, nullptr, nullptr);
+        if (status == ERROR_NO_MORE_ITEMS)
+            return ERROR_SUCCESS;
+        if (status != ERROR_SUCCESS)
+            return status;
+        HKEY child = nullptr;
+        status = RegOpenKeyExW(key, name.data(), 0, KEY_READ, &child);
+        if (status != ERROR_SUCCESS)
+            return status;
+        const std::wstring sub = path.empty() ? std::wstring(name.data(), chars)
+                                              : path + L"\\" + std::wstring(name.data(), chars);
+        status = SnapshotKey(child, sub, snapshot, depth + 1);
+        RegCloseKey(child);
+        if (status != ERROR_SUCCESS)
+            return status;
+    }
+}
+}
+
+LSTATUS SnapshotRegistryTree(HKEY root, const wchar_t* path, RegistryTree& snapshot)
+{
+    snapshot = {};
+    HKEY key = nullptr;
+    LSTATUS status = RegOpenKeyExW(root, path, 0, KEY_READ, &key);
+    if (status == ERROR_FILE_NOT_FOUND)
+        return ERROR_SUCCESS;
+    if (status != ERROR_SUCCESS)
+        return status;
+    status = SnapshotKey(key, L"", snapshot, 0);
+    RegCloseKey(key);
+    snapshot.existed = status == ERROR_SUCCESS;
+    return status;
+}
+
+LSTATUS RestoreRegistryTree(HKEY root, const wchar_t* path, const RegistryTree& snapshot)
+{
+    LSTATUS status = RegDeleteTreeW(root, path);
+    if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND)
+        return status;
+    if (!snapshot.existed)
+        return ERROR_SUCCESS;
+    for (const auto& record : snapshot.keys)
+    {
+        const std::wstring full = record.path.empty() ? std::wstring(path)
+                                                     : std::wstring(path) + L"\\" + record.path;
+        HKEY key = nullptr;
+        status = RegCreateKeyExW(root, full.c_str(), 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr);
+        if (status != ERROR_SUCCESS)
+            return status;
+        for (const auto& value : record.values)
+        {
+            status = RegSetValueExW(key, value.name.c_str(), 0, value.type, value.data.data(),
+                                    static_cast<DWORD>(value.data.size()));
+            if (status != ERROR_SUCCESS)
+                break;
+        }
+        RegCloseKey(key);
+        if (status != ERROR_SUCCESS)
+            return status;
+    }
+    return ERROR_SUCCESS;
+}
+
 // ---- files / processes -----------------------------------------------------------------
 
 namespace
 {
 
-bool DeleteTreeUnchecked(const std::wstring& dir)
+bool DeleteTreeUnchecked(const std::wstring& path, bool verifyPhysicalPath = false)
 {
-    WIN32_FIND_DATAW find = {};
-    const HANDLE search = FindFirstFileW((dir + L"\\*").c_str(), &find);
-    if (search != INVALID_HANDLE_VALUE)
+    // Deny rename/delete while the handle identifies the object being examined.
+    HANDLE handle = CreateFileW(path.c_str(),
+        DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    bool ok = GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &info, sizeof(info)) != 0;
+    const DWORD chars = ok ? GetFinalPathNameByHandleW(handle, nullptr, 0, FILE_NAME_NORMALIZED) : 0;
+    std::vector<wchar_t> physical(static_cast<size_t>(chars) + 1);
+    const DWORD got = chars ? GetFinalPathNameByHandleW(handle, physical.data(),
+                                  static_cast<DWORD>(physical.size()), FILE_NAME_NORMALIZED) : 0;
+    ok = ok && got > 0 && got < physical.size();
+    if (ok && verifyPhysicalPath && _wcsicmp(path.c_str(), physical.data()) != 0)
     {
-        do
-        {
-            if (wcscmp(find.cFileName, L".") == 0 || wcscmp(find.cFileName, L"..") == 0)
-                continue;
-            const std::wstring child = dir + L"\\" + find.cFileName;
-            if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            {
-                DeleteTreeUnchecked(child);
-            }
-            else
-            {
-                SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL);
-                DeleteFileW(child.c_str());
-            }
-        } while (FindNextFileW(search, &find));
-        FindClose(search);
+        ok = false;
+        SetLastError(ERROR_ACCESS_DENIED);
     }
-    return RemoveDirectoryW(dir.c_str()) != 0;
+    if (ok && (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+    {
+        // Enumerate the directory handle itself; path-based enumeration could
+        // follow a concurrently substituted junction.
+        bool first = true;
+        alignas(FILE_ID_BOTH_DIR_INFO) BYTE buffer[16384];
+        while (ok)
+        {
+            if (!GetFileInformationByHandleEx(handle,
+                    first ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+                    buffer, sizeof(buffer)))
+            {
+                ok = GetLastError() == ERROR_NO_MORE_FILES;
+                break;
+            }
+            first = false;
+            auto* entry = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(buffer);
+            for (;;)
+            {
+                const std::wstring name(entry->FileName, entry->FileNameLength / sizeof(wchar_t));
+                if (name != L"." && name != L"..")
+                {
+                    const std::wstring child = std::wstring(physical.data()) + L"\\" + name;
+                    if (!DeleteTreeUnchecked(child, true))
+                        ok = false;
+                }
+                if (!entry->NextEntryOffset)
+                    break;
+                entry = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(
+                    reinterpret_cast<BYTE*>(entry) + entry->NextEntryOffset);
+            }
+        }
+    }
+    if (ok && (info.FileAttributes & FILE_ATTRIBUTE_READONLY))
+    {
+        FILE_BASIC_INFO basic{};
+        basic.FileAttributes = info.FileAttributes & ~FILE_ATTRIBUTE_READONLY;
+        if (!basic.FileAttributes) basic.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+        ok = SetFileInformationByHandle(handle, FileBasicInfo, &basic, sizeof(basic)) != 0;
+    }
+    if (ok)
+    {
+        FILE_DISPOSITION_INFO disposition{ TRUE };
+        ok = SetFileInformationByHandle(handle, FileDispositionInfo,
+                                        &disposition, sizeof(disposition)) != 0;
+    }
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    SetLastError(error);
+    return ok;
 }
 
 } // namespace

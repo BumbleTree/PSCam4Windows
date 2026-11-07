@@ -1,8 +1,10 @@
 #include "DeviceProfiles.h"
 
+#include <iterator>   // std::size
+
 // PS3 Eye: all 13 native modes (Settings.h kVideoModes); serves YUY2 + NV12;
-// default NV12 640x480@60 (unchanged from the current DLL default). No LED hook
-// (the PS3 Eye LED follows USB power, not a software GPIO).
+// default NV12 640x480@60. No LED hook (the PS3 Eye LED follows USB power, not a
+// software GPIO).
 static const DeviceProfile kPs3EyeProfile = {
     0x1415, 0x2000,
     TransportClass::UsbBulk_Libusb,
@@ -31,7 +33,7 @@ static const DeviceProfile kEyeToyProfile = {
     0x054C, 0x0154,
     TransportClass::UsbIso_Libusb,
     L"PS2 EyeToy",
-    kEyeToyModes, static_cast<uint32_t>(sizeof(kEyeToyModes) / sizeof(kEyeToyModes[0])),
+    kEyeToyModes, static_cast<uint32_t>(std::size(kEyeToyModes)),
     FMT_YUY2 | FMT_MJPEG,
     { 320, 240, 30 },
     FMT_YUY2,
@@ -77,9 +79,10 @@ const DeviceProfile& EyeToyProfile() { return kEyeToyProfile; }
 // chroma magnitude; sharpness 0->8 moves mean |dY/dx| 3.05 -> 5.14). Both look
 // inert to luma-only photometry, which is why they must be measured in chroma.
 // HUE is the one that stays hidden — genuinely inert.
-// All nine hardware-verified delivered modes (see ps4::kIspGeometries).
-// 120 and 240 fps DO work: the old "60 fps only" verdict
-// came from sending the 1280x800 dwMaxVideoFrameSize with every frame index.
+//
+// 120 and 240 fps work, provided each frame index is committed with its own
+// dwMaxVideoFrameSize: sending the 1280x800 size with every index makes the
+// faster modes look unsupported.
 static const VideoMode kPs4EyeModes[] = {
     { 1280, 800,  60 },   // default — full stereo, sensor-native
     { 1280, 800,  30 },
@@ -103,8 +106,8 @@ static const VideoMode kPs4SbsModes[] = {
     {  640, 192, 120 },
     {  640, 192,  60 },
 };
-static const uint32_t kPs4EyeModeCount = (uint32_t)(sizeof(kPs4EyeModes) / sizeof(kPs4EyeModes[0]));
-static const uint32_t kPs4SbsModeCount = (uint32_t)(sizeof(kPs4SbsModes) / sizeof(kPs4SbsModes[0]));
+static const uint32_t kPs4EyeModeCount = static_cast<uint32_t>(std::size(kPs4EyeModes));
+static const uint32_t kPs4SbsModeCount = static_cast<uint32_t>(std::size(kPs4SbsModes));
 
 // The ISP's picture controls are 0..8, so their sliders get nine detents rather
 // than 256 positions for nine outcomes. White balance is a real Kelvin axis.
@@ -116,7 +119,13 @@ static const ControlRange kPs4Ranges[] = {
     { CTRL_SHARPNESS,  9, 0, 0 },
     { CTRL_WB_TEMP,    0, 2800, 6500 },
 };
-static const uint32_t kPs4RangeCount = (uint32_t)(sizeof(kPs4Ranges) / sizeof(kPs4Ranges[0]));
+static const uint32_t kPs4RangeCount = static_cast<uint32_t>(std::size(kPs4Ranges));
+
+// Every view drives the same physical ISP, so all three advertise one control set.
+constexpr uint32_t kPs4Controls =
+    CTRL_FLIP | CTRL_BRIGHTNESS | CTRL_CONTRAST | CTRL_ISPGAIN | CTRL_WHITEBAL |
+    CTRL_WB_TEMP | CTRL_MICARRAY | CTRL_SATURATION | CTRL_SHARPNESS |
+    CTRL_POWERLINE;
 
 static const DeviceProfile kPs4LeftProfile = {
     0x05A9, 0x058A,
@@ -127,9 +136,7 @@ static const DeviceProfile kPs4LeftProfile = {
     { 1280, 800, 60 },
     FMT_YUY2,
     false,
-    CTRL_FLIP | CTRL_BRIGHTNESS | CTRL_CONTRAST | CTRL_ISPGAIN | CTRL_WHITEBAL |
-        CTRL_WB_TEMP | CTRL_MICARRAY | CTRL_SATURATION | CTRL_SHARPNESS |
-        CTRL_POWERLINE,
+    kPs4Controls,
     kPs4Ranges, kPs4RangeCount,
 };
 static const DeviceProfile kPs4RightProfile = {
@@ -141,9 +148,7 @@ static const DeviceProfile kPs4RightProfile = {
     { 1280, 800, 60 },
     FMT_YUY2,
     false,
-    CTRL_FLIP | CTRL_BRIGHTNESS | CTRL_CONTRAST | CTRL_ISPGAIN | CTRL_WHITEBAL |
-        CTRL_WB_TEMP | CTRL_MICARRAY | CTRL_SATURATION | CTRL_SHARPNESS |
-        CTRL_POWERLINE,
+    kPs4Controls,
     kPs4Ranges, kPs4RangeCount,
 };
 static const DeviceProfile kPs4SbsProfile = {
@@ -155,9 +160,7 @@ static const DeviceProfile kPs4SbsProfile = {
     { 2560, 800, 60 },
     FMT_YUY2,
     false,
-    CTRL_FLIP | CTRL_BRIGHTNESS | CTRL_CONTRAST | CTRL_ISPGAIN | CTRL_WHITEBAL |
-        CTRL_WB_TEMP | CTRL_MICARRAY | CTRL_SATURATION | CTRL_SHARPNESS |
-        CTRL_POWERLINE,
+    kPs4Controls,
     kPs4Ranges, kPs4RangeCount,
 };
 
@@ -169,16 +172,4 @@ const DeviceProfile& Ps4ViewProfile(Ps4ViewKind view)
     case Ps4ViewKind::Right: return kPs4RightProfile;
     default:                 return kPs4SbsProfile;   // SideBySide
     }
-}
-
-const DeviceProfile* FindDeviceProfile(uint16_t vid, uint16_t pid)
-{
-    if (vid == 0x1415 && pid == 0x2000) return &kPs3EyeProfile;
-    if (vid == 0x054C && (pid == 0x0154 || pid == 0x0155)) return &kEyeToyProfile;
-    // PS4 camera in ANY USB identity (0580 bootloader / 058A legacy-firmware
-    // streaming / 058B final-firmware composite streaming) resolves to the base
-    // "PS4 Camera" profile. The registry picks the actual per-slot view
-    // (Left/Right/SBS) via Ps4ViewProfile + Settings; this is the physical-ID lookup.
-    if (vid == 0x05A9 && (pid == 0x0580 || pid == 0x058A || pid == 0x058B)) return &kPs4SbsProfile;
-    return nullptr;
 }

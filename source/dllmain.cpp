@@ -68,21 +68,29 @@ public:
             return E_POINTER;
         *ppv = nullptr;
         AutoLock lock(_lock);
-        if (!_source)
+        ComPtr<MediaSource> source;
+        source.Attach(new (std::nothrow) MediaSource(_cameraIndex));
+        if (!source)
+            return E_OUTOFMEMORY;
+        HRESULT hr = source->Initialize(_attributes.Get());
+        if (FAILED(hr))
         {
-            ComPtr<MediaSource> source;
-            source.Attach(new (std::nothrow) MediaSource(_cameraIndex));
-            if (!source)
-                return E_OUTOFMEMORY;
-            HRESULT hr = source->Initialize(_attributes.Get());
-            if (FAILED(hr))
-            {
-                VCamTrace(L"activator: source init failed 0x%08X", hr);
-                return hr;
-            }
-            _source = source;
+            VCamTrace(L"activator: source init failed 0x%08X", hr);
+            return hr;
         }
-        return _source.CopyTo(riid, ppv);
+        hr = source.CopyTo(riid, ppv);
+        if (FAILED(hr))
+        {
+            source->Shutdown();
+            return hr;
+        }
+        // Every activation builds its own source: the Frame Server shuts a
+        // source down when its client leaves, and handing that dead object to
+        // the next activation would fail every reopen. The activator remembers
+        // only the latest one, for ShutdownObject/DetachObject; earlier ones
+        // belong to whoever activated them and are shut down by their owners.
+        _source = source;
+        return S_OK;
     }
 
     STDMETHODIMP ShutdownObject() override
@@ -136,7 +144,7 @@ public:
     STDMETHODIMP CopyAllItems(IMFAttributes* dest) override { return _attributes->CopyAllItems(dest); }
 
 private:
-    Activator(int cameraIndex) : _cameraIndex(cameraIndex) { DllAddRef(); }
+    explicit Activator(int cameraIndex) : _cameraIndex(cameraIndex) { DllAddRef(); }
     virtual ~Activator() = default;
 
     HRESULT Initialize() { return MFCreateAttributes(&_attributes, 4); }
@@ -145,7 +153,7 @@ private:
     CritSec _lock;
     int     _cameraIndex;
     ComPtr<IMFAttributes> _attributes;
-    ComPtr<MediaSource>   _source;
+    ComPtr<MediaSource>   _source;      // the most recent activation only
 };
 
 // ===========================================================================
@@ -155,7 +163,7 @@ private:
 class ClassFactory final : public IClassFactory
 {
 public:
-    ClassFactory(int cameraIndex) : _cameraIndex(cameraIndex) { DllAddRef(); }
+    explicit ClassFactory(int cameraIndex) : _cameraIndex(cameraIndex) { DllAddRef(); }
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
     {
@@ -267,21 +275,27 @@ STDAPI DllRegisterServer()
 
         wchar_t description[128];
         swprintf_s(description, L"PSCam4Win Virtual Camera Media Source #%d", i);
-        RegSetValueExW(key, nullptr, 0, REG_SZ,
+        status = RegSetValueExW(key, nullptr, 0, REG_SZ,
                        reinterpret_cast<const BYTE*>(description),
                        static_cast<DWORD>((wcslen(description) + 1) * sizeof(wchar_t)));
+        if (status != ERROR_SUCCESS)
+            overallStatus = status;
 
         HKEY inproc = nullptr;
         status = RegCreateKeyExW(key, L"InprocServer32", 0, nullptr, 0,
                                  KEY_WRITE, nullptr, &inproc, nullptr);
         if (status == ERROR_SUCCESS)
         {
-            RegSetValueExW(inproc, nullptr, 0, REG_SZ,
+            status = RegSetValueExW(inproc, nullptr, 0, REG_SZ,
                            reinterpret_cast<const BYTE*>(modulePath),
                            static_cast<DWORD>((wcslen(modulePath) + 1) * sizeof(wchar_t)));
+            if (status != ERROR_SUCCESS)
+                overallStatus = status;
             const wchar_t threading[] = L"Both";
-            RegSetValueExW(inproc, L"ThreadingModel", 0, REG_SZ,
+            status = RegSetValueExW(inproc, L"ThreadingModel", 0, REG_SZ,
                            reinterpret_cast<const BYTE*>(threading), sizeof(threading));
+            if (status != ERROR_SUCCESS)
+                overallStatus = status;
             RegCloseKey(inproc);
         }
         else

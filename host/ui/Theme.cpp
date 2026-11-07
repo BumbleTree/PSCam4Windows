@@ -1,6 +1,7 @@
 #include "Theme.h"
 
 #include <dwmapi.h>
+#include <vector>
 #include "../../common/Settings.h"
 
 namespace theme {
@@ -59,10 +60,8 @@ Mode       g_mode      = Mode::Dark;
 bool       g_dark      = true;
 int        g_dpi       = 96;
 HFONT      g_fonts[kFontCount] = {};
-BrushEntry g_brushes[24] = {};
-int        g_brushCount = 0;
-PenEntry   g_pens[24] = {};
-int        g_penCount  = 0;
+std::vector<BrushEntry> g_brushes;
+std::vector<PenEntry> g_pens;
 
 void FreeGdi()
 {
@@ -71,9 +70,9 @@ void FreeGdi()
         if (g_fonts[i]) DeleteObject(g_fonts[i]);
         g_fonts[i] = nullptr;
     }
-    for (int i = 0; i < g_brushCount; ++i) DeleteObject(g_brushes[i].h);
-    for (int i = 0; i < g_penCount; ++i)   DeleteObject(g_pens[i].h);
-    g_brushCount = g_penCount = 0;
+    for (const auto& b : g_brushes) DeleteObject(b.h);
+    for (const auto& p : g_pens) DeleteObject(p.h);
+    g_brushes.clear(); g_pens.clear();
 }
 
 void BuildFonts()
@@ -180,23 +179,17 @@ HFONT GetFont(Font f)
 
 HBRUSH Brush(COLORREF c)
 {
-    for (int i = 0; i < g_brushCount; ++i)
-        if (g_brushes[i].c == c) return g_brushes[i].h;
-    if (g_brushCount == (int)(sizeof(g_brushes) / sizeof(g_brushes[0])))
-        return g_brushes[0].h;
+    for (const auto& b : g_brushes) if (b.c == c) return b.h;
     HBRUSH h = CreateSolidBrush(c);
-    g_brushes[g_brushCount++] = { c, h };
+    if (h) g_brushes.push_back({ c, h });
     return h;
 }
 
 HPEN Pen(COLORREF c, int width)
 {
-    for (int i = 0; i < g_penCount; ++i)
-        if (g_pens[i].c == c && g_pens[i].w == width) return g_pens[i].h;
-    if (g_penCount == (int)(sizeof(g_pens) / sizeof(g_pens[0])))
-        return g_pens[0].h;
+    for (const auto& p : g_pens) if (p.c == c && p.w == width) return p.h;
     HPEN h = CreatePen(PS_SOLID, width, c);
-    g_pens[g_penCount++] = { c, width, h };
+    if (h) g_pens.push_back({ c, width, h });
     return h;
 }
 

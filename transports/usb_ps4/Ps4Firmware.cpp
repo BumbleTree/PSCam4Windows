@@ -60,9 +60,8 @@ std::wstring ProgramDataDir()
 }
 
 // Try each candidate directory in priority order; return the first that yields
-// a non-empty read of `name`.
-// Candidate directories, in priority order. Deliberately ALL ABSOLUTE: a
-// relative entry resolves against the CWD, and this process runs elevated.
+// a non-empty read of `name`. Deliberately ALL ABSOLUTE: a relative entry
+// resolves against the CWD, and this process runs elevated.
 std::vector<uint8_t> LocateBlob(const wchar_t* name)
 {
     const std::wstring dirs[] = { ProgramDataDir(), ExeDir() };
@@ -120,7 +119,7 @@ int IdentifyFirmware(const std::vector<uint8_t>& data)
 
 // startup.bin is replayed verbatim as USB control transfers, so it is pinned
 // like firmware.bin. Same SHA-1 the installer downloads (kFwSha1[1]).
-static const char* const kStartupSha1 = "48d103615008f73a286014ee5408ea9617bb1d3d";
+constexpr const char* kStartupSha1 = "48d103615008f73a286014ee5408ea9617bb1d3d";
 
 FirmwareBlobs EnsureFirmware()
 {
@@ -182,7 +181,7 @@ bool UploadFirmware(libusb_device_handle* h, const std::vector<uint8_t>& fw)
         value += size;
     }
 
-    // Reboot into the freshly-loaded firmware (re-enumerates as 058A). This
+    // Reboot into the freshly-loaded firmware (re-enumerates as 058B). This
     // tears the device down, so the transfer usually errors -- expected.
     uint8_t go = 0x5b;
     libusb_control_transfer(h, 0x40, 0x00, 0x2200, 0x8018, &go, 1, 1000);

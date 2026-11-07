@@ -1,9 +1,9 @@
 #pragma once
 //
 // Ps3EyeDevice — ICameraDevice over the vendored PS3EYEDriver (WinUSB bulk,
-// ctx #1). Thin, behaviour-preserving wrapper: the fused Bayer->YUY2 debayer,
-// the sub-millisecond bulk path, and the sensor control writes are all the
-// existing PS3EYECam code, unchanged. The DeviceRegistry injects the PS3EYERef.
+// ctx #1). A thin wrapper: the fused Bayer->YUY2 debayer, the sub-millisecond
+// bulk path and the sensor control writes all live in PS3EYECam. The
+// DeviceRegistry injects the PS3EYERef.
 //
 #include <memory>
 #include "../../host/ICameraDevice.h"

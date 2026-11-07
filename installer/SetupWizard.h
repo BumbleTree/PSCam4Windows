@@ -1,9 +1,9 @@
 #pragma once
 //
 // The wizard window: one frame dialog hosting seven child page dialogs
-// (created once, toggled with ShowWindow -- same DIALOGEX/Segoe-UI idiom as
-// host\SettingsDialog.cpp). The install/uninstall engine runs on a worker
-// thread; the frame receives WM_APP_LOG / WM_APP_PROGRESS / WM_APP_DONE.
+// (created once, toggled with ShowWindow). The install/uninstall engine runs
+// on a worker thread; the frame receives WM_APP_LOG / WM_APP_PROGRESS /
+// WM_APP_DONE.
 //
 #include <windows.h>
 #include <memory>

@@ -15,19 +15,19 @@
 // Two details make this unreachable by accident:
 //   * the vendor register payload is [0]=mode, [1..7]=0, then 4-byte records
 //     {reg_lo, reg_hi, val, subaddr} from offset 8, length 8+4n — NOT the raw
-//     buffer offsets the reference driver uses, which include libusb'''s 8-byte
+//     buffer offsets the reference driver uses, which include libusb's 8-byte
 //     control SETUP header;
 //   * the mode byte is per-subaddress: 0x03 for the sensors and the OV580,
 //     but 0x0b to write the AK5703 (0x08 to read it).
 //
 namespace ps4 {
 
-static const unsigned char kAk5703Subaddr   = 0x24;
-static const unsigned char kAk5703WriteMode = 0x0b;
-static const unsigned char kAk5703ReadMode  = 0x08;
+constexpr unsigned char kAk5703Subaddr   = 0x24;
+constexpr unsigned char kAk5703WriteMode = 0x0b;
+constexpr unsigned char kAk5703ReadMode  = 0x08;
 
 struct Ak5703Reg { unsigned short reg; unsigned char val; };
-static const Ak5703Reg kAk5703Init[] = {
+constexpr Ak5703Reg kAk5703Init[] = {
     // ak5703_reg_init0
     { 0x0000, 0x0f },
     // ak5703_reg_init1
@@ -111,9 +111,6 @@ static const Ak5703Reg kAk5703Init[] = {
     { 0x0000, 0x0f },
     { 0x0010, 0x0b },
 };
-static const int kAk5703InitCount = (int)(sizeof(kAk5703Init) / sizeof(kAk5703Init[0]));
-
-// Registers the reference driver reads back after the init (Sony's own driver
-// does the same in the USB capture), useful as an "is the ADC answering" probe.
+constexpr int kAk5703InitCount = (int)(sizeof(kAk5703Init) / sizeof(kAk5703Init[0]));
 
 } // namespace ps4

@@ -23,9 +23,9 @@
 // 2. THE CLOCKS DO NOT MATCH, and not by a little. The camera runs at 60.029 fps
 //    rather than 60.000, so the microphone really arrives at ~48,023 Hz while a
 //    48,000 Hz endpoint consumes 48,000 — **+23 samples a second, which overruns
-//    a 40 ms buffer in under two seconds**. The offset is also
-//    per video mode: the two 640x400 modes share a line rate 533 ppm away from
-//    1280x800@60, so it cannot be tabulated either.
+//    a 40 ms buffer in under two seconds**. The offset is also per video mode:
+//    the two 640x400 modes share a line rate 533 ppm away from 1280x800@60, so
+//    it cannot be tabulated either.
 //
 //    So the read ratio is closed-loop on RING FILL, not open-loop on any
 //    measured constant. Fill is the only observable that sees both clocks —
@@ -51,7 +51,7 @@ struct Endpoint
     bool looksLikeVirtualCable = false;
     // When it IS a cable: the capture endpoint audio sent here comes back out
     // of — i.e. the name the user must pick in Discord. Verified present, not
-    // inferred from the render name (Steam Streaming Speakers fooled that).
+    // inferred from the render name (Steam Streaming Speakers would fool that).
     std::wstring captureName;
 };
 

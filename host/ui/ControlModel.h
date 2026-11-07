@@ -110,12 +110,10 @@ inline bool Satisfied(const Interlock& k, uint32_t mask, const Settings& s)
 
 inline bool Shown(uint32_t cap, uint32_t mask) { return (mask & cap) != 0; }
 
-inline bool Live(const SliderDef& d, uint32_t mask, const Settings& s, bool ownsShared)
-{
-    return Satisfied(d.lock, mask, s) && (ownsShared || !d.sharedHw);
-}
-
-inline bool Live(const ToggleDef& d, uint32_t mask, const Settings& s, bool ownsShared)
+// Enabled unless its interlock binds or it drives shared ISP state this view
+// does not own. `Def` is SliderDef or ToggleDef.
+template <class Def>
+inline bool Live(const Def& d, uint32_t mask, const Settings& s, bool ownsShared)
 {
     return Satisfied(d.lock, mask, s) && (ownsShared || !d.sharedHw);
 }

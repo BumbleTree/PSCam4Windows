@@ -50,6 +50,16 @@ struct Header
 };
 #pragma pack(pop)
 
+// Milliseconds since a lastActivityTick stamp; MAXULONGLONG for 0 (never
+// stamped). A stamp from the future reads as age 0.
+inline ULONGLONG AgeOfTick(LONG64 tick)
+{
+    if (tick == 0)
+        return MAXULONGLONG;
+    const ULONGLONG now = GetTickCount64();
+    return now > static_cast<ULONGLONG>(tick) ? now - static_cast<ULONGLONG>(tick) : 0;
+}
+
 // ------------------------------------------------------------------ Host ----
 
 class Host
@@ -57,7 +67,7 @@ class Host
 public:
     ~Host() { Close(); }
 
-    bool Create(int cameraIndex)
+    [[nodiscard]] bool Create(int cameraIndex)
     {
         wchar_t sectionName[64];
         wchar_t wakeEventName[64];
@@ -92,11 +102,7 @@ public:
     {
         if (!_view)
             return MAXULONGLONG;   // never created / already closed == never active
-        const LONG64 tick = ReadAcquire64(&_view->lastActivityTick);
-        if (tick == 0)
-            return MAXULONGLONG;
-        const ULONGLONG now = GetTickCount64();
-        return now > static_cast<ULONGLONG>(tick) ? now - static_cast<ULONGLONG>(tick) : 0;
+        return AgeOfTick(ReadAcquire64(&_view->lastActivityTick));
     }
 
     // ConsumerFormat bits the active client negotiated (0 = none). Plain aligned
@@ -219,14 +225,7 @@ inline ULONGLONG ActivityAge(int cameraIndex)
         MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0));
     ULONGLONG age = MAXULONGLONG;
     if (view && view->magic == kMagic)
-    {
-        const LONG64 tick = ReadAcquire64(&view->lastActivityTick);
-        if (tick != 0)
-        {
-            const ULONGLONG now = GetTickCount64();
-            age = now > static_cast<ULONGLONG>(tick) ? now - static_cast<ULONGLONG>(tick) : 0;
-        }
-    }
+        age = AgeOfTick(ReadAcquire64(&view->lastActivityTick));
     if (view)
         UnmapViewOfFile(view);
     CloseHandle(map);

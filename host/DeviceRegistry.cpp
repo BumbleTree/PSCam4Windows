@@ -20,24 +20,26 @@
 #include "../transports/usb_ps4/Ps4CaptureSource.h"   // RetireAbsent
 
 // DeviceRegistry — the single authoritative owner of the slot -> device map.
-// Two enumerators feed it:
+// Three enumerators feed it:
 //   * the vendored PS3 driver's getDevices() pool (ctx #1), which owns its own
 //     stable 0..7 port-path index for PS3 Eyes;
-//   * eyetoy::EnumeratePortPaths() (ctx #2) for EyeToys.
+//   * eyetoy::EnumeratePortPaths() (ctx #2) for EyeToys;
+//   * ps4::EnumeratePortPaths() (ctx #3) for PS4 cameras.
 //
 // PS3 Eyes are AUTHORITATIVE on their getDevices() slot index — that index is
 // the slot, so a PS3-only system's slot map is fixed by the driver pool and
 // nothing here can perturb it. EyeToys then fill the slots PS3 does not claim,
 // assigned top-down (slot 7 first) and kept stable by port path across rescans,
-// so two EyeToys keep distinct, stable virtual-camera slots through replug.
+// so two EyeToys keep distinct, stable virtual-camera slots through replug. PS4
+// cameras fill what is left the same way (Ps4SlotAssign.h).
 
 namespace {
 
 using deviceregistry::Ps4SlotRec;
 using deviceregistry::AssignPs4Slots;
 
-// Serializes both enumerations and the persistent EyeToy slot assignment across
-// every per-slot capture thread (was CaptureController's g_devicesLock).
+// Serializes the enumerations and the persistent EyeToy/PS4 slot assignments
+// across every per-slot capture thread.
 SRWLOCK g_lock = SRWLOCK_INIT;
 
 // Persistent EyeToy assignment: g_eyeToySlot[i] is the port path of the EyeToy
@@ -50,8 +52,17 @@ std::string g_eyeToySlot[kVCamCount];
 // the camera's USB port path plus how it presents that camera (switchable = one
 // slot, view from Settings; split = two slots with fixed Left/Right views). The
 // reconciliation math is in Ps4SlotAssign.h (pure + unit-tested). The port path
-// is stable across the 0580->058A firmware re-enumeration, so a slot survives it.
+// is stable across the 0580->058A/058B firmware re-enumeration, so a slot
+// survives it.
 Ps4SlotRec g_ps4Slot[kVCamCount];
+
+using Ps3Pool = std::vector<ps3eye::PS3EYECam::PS3EYERef>;
+
+// True when the PS3 driver pool holds a camera at `slot` (the pool is sparse).
+bool HasPs3(const Ps3Pool& ps3, int slot)
+{
+    return ps3.size() > static_cast<size_t>(slot) && ps3[slot] != nullptr;
+}
 
 // The Ps4ViewKind a PS4 slot presents. A split slot uses its fixed view; a
 // switchable slot reads its persisted per-camera Settings (ps4View; default
@@ -78,7 +89,7 @@ constexpr ULONGLONG kCacheTtlMs = 2000;
 
 // Rebuild the unified map. Caller holds g_lock. Returns the PS3 pool (sparse
 // 8-vector indexed by port path) so callers can mint a PS3EYERef by slot index.
-const std::vector<ps3eye::PS3EYECam::PS3EYERef>& RebuildLocked(bool force)
+const Ps3Pool& RebuildLocked(bool force)
 {
     const ULONGLONG now = GetTickCount64();
     if (!force && g_cacheValid && (now - g_lastScanTick) < kCacheTtlMs)
@@ -92,8 +103,8 @@ const std::vector<ps3eye::PS3EYECam::PS3EYERef>& RebuildLocked(bool force)
     const auto& ps3 = ps3eye::PS3EYECam::getDevices(true);
 
     bool ps3Slot[kVCamCount] = {};
-    for (int i = 0; i < kVCamCount && i < static_cast<int>(ps3.size()); ++i)
-        ps3Slot[i] = (ps3[i] != nullptr);
+    for (int i = 0; i < kVCamCount; ++i)
+        ps3Slot[i] = HasPs3(ps3, i);
 
     // Candidate EyeToys, in deterministic order so assignment is reproducible.
     std::vector<std::string> eyes = eyetoy::EnumeratePortPaths();
@@ -146,10 +157,10 @@ const std::vector<ps3eye::PS3EYECam::PS3EYERef>& RebuildLocked(bool force)
                        // Honor a persisted split only if it was set for THIS camera
                        // (port path); otherwise a different camera reusing this slot
                        // index would inherit a stale split and grab a second slot.
-                       // Owner 0 is accepted as a wildcard: it marks a split saved
-                       // before owner tagging existed (or with the camera briefly
-                       // absent) — rejecting it would silently un-split every
-                       // pre-upgrade setup. It gets stamped on the next Split toggle.
+                       // Owner 0 is accepted as a wildcard: it marks a split stored
+                       // without an owner tag (or saved with the camera briefly
+                       // absent), and rejecting it would silently un-split such a
+                       // setup. It gets stamped on the next Split toggle.
                        const Settings s = settings::Load(homeSlot);
                        return s.ps4Split &&
                               (s.ps4SplitOwner == 0 ||
@@ -168,7 +179,7 @@ const DeviceProfile* ProfileForSlot(int slot)
         return nullptr;
     AcquireSRWLockExclusive(&g_lock);
     const auto& ps3 = RebuildLocked(false);   // read-only query: cache is fine
-    const bool isPs3 = ps3.size() > static_cast<size_t>(slot) && ps3[slot] != nullptr;
+    const bool isPs3 = HasPs3(ps3, slot);
     const bool isEye = !g_eyeToySlot[slot].empty();
     const Ps4SlotRec ps4 = g_ps4Slot[slot];   // copy under lock
     ReleaseSRWLockExclusive(&g_lock);
@@ -184,8 +195,7 @@ unsigned OccupiedSlotMask()
     AcquireSRWLockExclusive(&g_lock);
     const auto& ps3 = RebuildLocked(false);   // read-only query: cache is fine
     for (int i = 0; i < kVCamCount; ++i)
-        if ((ps3.size() > static_cast<size_t>(i) && ps3[i] != nullptr) ||
-            !g_eyeToySlot[i].empty() || !g_ps4Slot[i].portPath.empty())
+        if (HasPs3(ps3, i) || !g_eyeToySlot[i].empty() || !g_ps4Slot[i].portPath.empty())
             m |= (1u << i);
     ReleaseSRWLockExclusive(&g_lock);
     return m;
@@ -208,10 +218,10 @@ void SlotDisplayName(int slot, wchar_t* buf, size_t cap)
     const auto& ps3 = RebuildLocked(false);   // read-only query: cache is fine
     for (int i = 0; i < kVCamCount; ++i)
     {
-        if (ps3.size() > static_cast<size_t>(i) && ps3[i] != nullptr) type[i] = 1;
-        else if (!g_eyeToySlot[i].empty())                           type[i] = 2;
-        else if (!g_ps4Slot[i].portPath.empty())                   { type[i] = 3; ps4[i] = g_ps4Slot[i]; }
-        else                                                         type[i] = 0;
+        if (HasPs3(ps3, i))                       type[i] = 1;
+        else if (!g_eyeToySlot[i].empty())        type[i] = 2;
+        else if (!g_ps4Slot[i].portPath.empty()) { type[i] = 3; ps4[i] = g_ps4Slot[i]; }
+        else                                      type[i] = 0;
     }
     ReleaseSRWLockExclusive(&g_lock);
 
@@ -263,8 +273,7 @@ std::unique_ptr<ICameraDevice> Acquire(int slot)
         return nullptr;
     AcquireSRWLockExclusive(&g_lock);
     const auto& ps3 = RebuildLocked(true);    // about to open hardware: be current
-    ps3eye::PS3EYECam::PS3EYERef eye =
-        (ps3.size() > static_cast<size_t>(slot)) ? ps3[slot] : nullptr;
+    ps3eye::PS3EYECam::PS3EYERef eye = HasPs3(ps3, slot) ? ps3[slot] : nullptr;
     std::string eyeToyPath = g_eyeToySlot[slot];
     const Ps4SlotRec ps4   = g_ps4Slot[slot];
     ReleaseSRWLockExclusive(&g_lock);

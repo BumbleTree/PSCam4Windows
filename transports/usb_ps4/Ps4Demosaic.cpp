@@ -78,7 +78,7 @@ inline uint8_t ClampU8(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)
 
 } // namespace
 
-void DemosaicBggrToYuy2(const uint8_t* bayer16, uint32_t w, uint32_t h,
+void DemosaicGrbgToYuy2(const uint8_t* bayer16, uint32_t w, uint32_t h,
                         uint8_t* yuy2, Ps4ToneState& tone,
                         bool flipH, bool flipV)
 {

@@ -131,7 +131,7 @@ public:
 
 private:
     HRESULT CreateMediaType(uint32_t width, uint32_t height, uint32_t fpsNum, uint32_t fpsDen, GUID subtype, IMFMediaType** ppType);
-    HRESULT DeliverSample(IUnknown* token);
+    HRESULT DeliverSample(IUnknown* token, uint64_t generation);
     void    FillBlack();
     void    PingActivity(bool forceWakeSignal);  // caller must hold _lock
 
@@ -150,8 +150,11 @@ private:
 
     MF_STREAM_STATE _state    = MF_STREAM_STATE_STOPPED;
     bool            _shutdown = false;
+    uint64_t        _generation = 0;
+    LONGLONG        _lastTimestamp = 0;
 
-    // Negotiated/advertised format (fixed for the lifetime of the source).
+    // Negotiated format. Start() may renegotiate it (holding both locks);
+    // DeliverSample works from a snapshot taken under _lock.
     GUID     _subtype = MFVideoFormat_NV12;
     uint32_t _consumerMask = 0;  // ControlBus ConsumerFormat bit for _subtype
     uint32_t _width = 640, _height = 480, _fpsNum = 60, _fpsDen = 1;
@@ -181,6 +184,7 @@ private:
     // _deliverLock.
     std::unique_ptr<uint8_t[]> _jpegStaging;
     uint32_t                   _lastJpegLen = 0;
+    std::vector<uint8_t>        _blackJpeg;
 
     // Sleep/wake keepalive towards the host. Closed by the destructor, not by
     // Shutdown (same in-flight-call rationale as _bus).

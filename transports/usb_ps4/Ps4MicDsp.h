@@ -65,17 +65,23 @@ public:
     static const uint32_t kRate     = 48000;   // the OUTPUT rate we resample to
     static const uint32_t kMaxEmit  = 16;      // ceiling on outputs from one row
 
-    // `validPerFrame` is how many raw samples per channel a frame really carries
-    // -- eyeH*8, NOT rows*8. The raw rate is validPerFrame*fps and the
-    // decimated rate is an
-    // eighth of that: 6400*60/8 = exactly 48,000 at 1280x800@60.
-    void Reset(uint32_t validPerFrame, uint32_t fps, const DspConfig& cfg = DspConfig())
+    // `slotsPerFrame` is how many raw samples per channel one video frame feeds
+    // in. The raw rate is slotsPerFrame*fps and the decimated rate is an eighth
+    // of that, which the resampler then takes to kRate. The live path passes
+    // every delivered slot, rows*8 (see Ps4CaptureSource::ResetMicDsp for why
+    // that, not eyeH*8, lands on the true content rate).
+    void Reset(uint32_t slotsPerFrame, uint32_t fps, const DspConfig& cfg = DspConfig())
     {
+        // Bound the output per row and the Q16 step before constructing filters.
+        const uint64_t rawRate = static_cast<uint64_t>(slotsPerFrame) * fps;
+        if (rawRate < 8ull * kRate / kMaxEmit || rawRate > 8ull * kRate * 65535)
+        { slotsPerFrame = 6400; fps = 60; }
         _cfg   = cfg;
         _taps  = cfg.taps < 8 ? 8 : (cfg.taps > kMaxTaps ? kMaxTaps : cfg.taps);
+        if ((_taps & (_taps - 1)) != 0) _taps = 64;
         _mask  = _taps - 1;
 
-        const double slotRate = (double)validPerFrame * (double)fps;
+        const double slotRate = (double)slotsPerFrame * (double)fps;
         const double inRate   = slotRate / 8.0;               // after 8:1
         const double cutoff   = cfg.cutoffFrac * inRate;
         const double kPi      = 3.14159265358979323846;
@@ -242,9 +248,9 @@ public:
     // does NOT say: honouring it measures WORSE).
     // The FIR spans 8 rows, so that garbage smears across the first ~14 outputs
     // and shows up as a step 2-6x the median at a FIXED offset, 60 times a
-    // second, scaling with the signal. That is the roughness on speech that
-    // survives the seam repair -- the seam sits at positions 799/0/1/2, so
-    // looked four samples to the left of the actual damage.
+    // second, scaling with the signal -- heard as roughness on speech. The
+    // damage starts about four samples into the frame, not at the frame seam
+    // (positions 799/0/1/2), which is why the window below begins at 4.
     //
     // Reconstruction is not available, so conceal instead: the window is fixed,
     // known and about ten samples of eight hundred, and a linear bridge across

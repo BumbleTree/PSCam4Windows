@@ -1,7 +1,5 @@
 #include "Ps4Usb.h"
 
-#include "../../common/UsbCore.h"
-
 // Facade over usbcore (common/UsbCore.h): the three PS4 identities, and ctx #3.
 
 namespace ps4 {
@@ -9,11 +7,6 @@ namespace ps4 {
 bool IsPs4(unsigned short vid, unsigned short pid)
 {
     return vid == kVid && (pid == kPidBoot || pid == kPidRun || pid == kPidRunNew);
-}
-bool IsPs4Boot(unsigned short vid, unsigned short pid) { return vid == kVid && pid == kPidBoot; }
-bool IsPs4Run(unsigned short vid, unsigned short pid)
-{
-    return vid == kVid && (pid == kPidRun || pid == kPidRunNew);
 }
 
 std::string PortPath(libusb_device* dev)

@@ -3,12 +3,13 @@
 // Ps4ViewDevice — an ICameraDevice that presents ONE logical view (Left, Right,
 // or SideBySide) of a shared Ps4CaptureSource as a virtual camera.
 //
-// It is a thin crop + demosaic adapter: it holds a shared_ptr to the per-camera
+// It is a thin crop + copy adapter: it holds a shared_ptr to the per-camera
 // Ps4CaptureSource (so split mode = two views over one source) and a Ps4ViewKind.
-// AcquireFrame pulls the newest raw-Bayer eye plane(s) off the source's latch and
-// runs the native-quality GRBG demosaic (Ps4Demosaic) into its YUY2 output. The
-// CaptureController drives it like any other device and stays the sole FrameBus
-// writer for its slot — no PS4 special-casing leaks up the stack.
+// AcquireFrame pulls the newest eye plane(s) off the source's latch and copies
+// the ISP's YUY2 (with optional software flip) into its output — or, in RAW
+// mode, runs the GRBG demosaic (Ps4Demosaic). The CaptureController drives it
+// like any other device and stays the sole FrameBus writer for its slot — no
+// PS4 special-casing leaks up the stack.
 //
 #include <cstdint>
 #include <memory>
@@ -39,7 +40,7 @@ public:
     bool AcquireFrame(AcquiredFrame& out, uint32_t timeoutMs, bool wantJpeg) override;
     void ApplySettings(const Settings& s) override;
     const DeviceProfile& Profile() const override;
-    bool SetView(int viewKind) override;
+    bool SetView(int viewKind) override;   // live Left/Right/SBS, no stream restart
 
     // What this view is really producing: the shared engine's committed
     // geometry, which is not necessarily what this slot asked for (a split
@@ -55,7 +56,7 @@ public:
     uint32_t AudioMeasuredRateMilliHz() const override;
     uint32_t ReadAudio(int16_t* dst, uint32_t frames) override;
     bool AudioLevels(float* out, uint32_t count) override;
-    uint32_t AudioDropouts() const override;   // live Left/Right/SBS, no stream restart
+    uint32_t AudioDropouts() const override;
 
 private:
     std::string _portPath;
@@ -65,10 +66,11 @@ private:
     std::shared_ptr<ps4::Ps4CaptureSource> _source;
     bool     _streaming = false;
     bool     _useIsp = false;   // source is YUYV ISP -> planes are YUY2, copy not demosaic
+    bool     _settingsOk = true;   // false once SetMicGain lost the stream
     uint32_t _width = 0, _height = 0, _fps = 0;
     uint64_t _lastSeq = 0;
 
-    // Software flip (latched by ApplySettings, consumed by the demosaic; both on
+    // Software flip (latched by ApplySettings, consumed by AcquireFrame; both on
     // the capture thread, so no sync needed).
     bool _flipH = false, _flipV = false;
 
@@ -76,8 +78,9 @@ private:
     // each eye independently so they don't fight each other.
     ps4::Ps4ToneState _toneL, _toneR;
 
-    // Capture-thread scratch: raw Bayer plane(s) snapshotted from the source, and
-    // (SideBySide only) per-eye YUY2 scratch composited into the wide output.
+    // Capture-thread scratch: the eye plane(s) snapshotted from the source (YUY2
+    // in ISP mode despite the name), and (RAW SideBySide only) per-eye YUY2
+    // scratch composited into the wide output.
     std::vector<uint8_t> _bayerL, _bayerR;
     std::vector<uint8_t> _eyeYuyvL, _eyeYuyvR;
     std::unique_ptr<uint8_t[]> _yuy2Out;   // published YUY2 (width*height*2)

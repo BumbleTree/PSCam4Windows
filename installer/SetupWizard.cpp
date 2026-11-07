@@ -211,17 +211,12 @@ void SetupWizard::OnInitFrame(HWND frame)
         L"for Discord, OBS, browsers, RPCS3, and everything else.\r\n\r\n"
         L"Setup will install the camera drivers you select, register the "
         L"virtual camera with Windows, and add PSCam4Win to Apps & Features.\r\n\r\n"
-#ifdef PSCAM_PUBLIC_RELEASE
-        L"The camera drivers use Microsoft's inbox WinUSB with signed catalogs. "
-        L"Setup does not add certificates to your trust stores. Windows may "
-        L"ask you to approve the driver publisher.\r\n\r\n"
-#else
         L"The camera drivers are Microsoft's own inbox WinUSB, but their INF "
         L"catalogs are self-signed. Windows will not accept a self-signed driver "
         L"package unless it trusts the signer, so setup adds each selected "
         L"package's certificate to the Trusted Root and Trusted Publishers "
-        L"stores. Uninstalling removes them again.\r\n\r\n"
-#endif
+        L"stores. Uninstalling removes everything setup installed, including "
+        L"those certificates.\r\n\r\n"
         L"Windows 11 is required. Administrator rights are required.",
         L"" PSCAM_VERSION_DISPLAY);
     SetDlgItemTextW(_pages[PageWelcome], IDC_WELCOME_TEXT, text);
@@ -277,7 +272,8 @@ void SetupWizard::OnInitFrame(HWND frame)
     SetDlgItemTextW(_pages[PageUnConfirm], IDC_UN_TEXT,
         L"PSCam4Win Virtual Camera will be removed from this computer: the "
         L"tray app, the virtual camera registration, the WinUSB drivers for "
-        L"all three cameras, and the driver-signing certificates.\r\n\r\n"
+        L"all three cameras (including any left by earlier releases), and the "
+        L"driver-signing certificates setup installed.\r\n\r\n"
         L"Saved camera settings and the PS4 firmware cache are kept unless "
         L"you tick the box below.");
 
@@ -473,9 +469,10 @@ void SetupWizard::StartEngine(bool uninstall)
         _beginthreadex(nullptr, 0, WorkerThunk, this, 0, nullptr));
     if (!_worker)
     {
-        _engineRunning = false;
         _logger.Line(L"error: could not start the worker thread");
-        OnEngineDone(EngineResult::Failed);
+        // Posted, not called: the caller navigates to the progress page right
+        // after this returns, which would otherwise bury the finish page.
+        PostMessageW(_frame, WM_APP_DONE, static_cast<WPARAM>(EngineResult::Failed), 0);
     }
 }
 
@@ -627,13 +624,18 @@ std::wstring SetupWizard::ComposeFinishText(EngineResult result) const
         break;
     }
     case EngineResult::Cancelled:
-        text = L"The installation was cancelled.\r\n\r\nEverything done so far was "
-               L"rolled back; nothing was left on the system.";
+        text = L"The installation was cancelled.\r\n\r\nRecovery details:\r\n" + _logger.Path();
         break;
     default:
-        text = L"The installation failed and every completed step was rolled "
-               L"back.\r\n\r\nDetails:\r\n" + _logger.Path();
+        text = L"The installation failed.\r\n\r\nDetails:\r\n" + _logger.Path();
         break;
+    }
+    if (_ctx && _ctx->rollbackIncomplete)
+    {
+        text += L"\r\n\r\nRecovery could not be completed. Re-run setup after "
+                L"closing camera apps; see the log for the items that need attention.";
+        if (!_ctx->backupDir.empty())
+            text += L"\r\n\r\nPrevious files have been retained at:\r\n" + _ctx->backupDir;
     }
     return text;
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <string>
 
 // Watches whether the PS3 Eye's 4-mic array is actually delivering audio.
 //
@@ -12,7 +13,7 @@
 //
 // The register restore in the PS3 transport prevents this happening in the
 // first place; this covers what prevention cannot reach — a camera already
-// wedged when the tray starts, and any path the fix misses.
+// wedged when the tray starts, and any path the restore misses.
 namespace micwatch
 {
     enum class Health : int
@@ -20,6 +21,13 @@ namespace micwatch
         Unknown = 0,   // not probed yet, or the endpoint could not be opened
         Alive,         // packets arrived
         Wedged,        // opened and started cleanly, then delivered nothing
+
+        // The camera is present but has no active capture endpoint, for a
+        // reason the user can fix:
+        WholeDeviceDriver,  // a driver owns the whole device, so usbccgp never
+                            // splits off the audio function (detail = service)
+        AudioDriverError,   // the audio function has a PnP problem (detail = code)
+        EndpointDisabled,   // the endpoint exists but is disabled in Sound settings
     };
 
     // Probes on a background thread and posts `msg` to `wnd` with
@@ -30,6 +38,10 @@ namespace micwatch
 
     // Last result, for the Settings status line.
     Health LastPs3Result();
+
+    // The service name or problem code behind the last non-Alive result, for
+    // the user-facing message. Empty when there is none.
+    std::wstring LastPs3Detail();
 
     // Forget the last result so the next arrival probes again. Call on a
     // device change: a replug is exactly what cures the wedge, so a camera that

@@ -11,7 +11,6 @@
 //
 #include "../SettingsDialog.h"
 
-#include <math.h>
 #include <memory>
 #include <shellapi.h>
 #include <string>
@@ -26,6 +25,8 @@
 #include "../Autostart.h"
 #include "../CameraPreview.h"
 #include "../DeviceRegistry.h"
+#include "../DeviceProfiles.h"
+#include "../Ps4SlotAssign.h"
 #include "../TrayUI.h"
 #include "../../common/AudioStatusBus.h"
 #include "../../common/Settings.h"
@@ -73,6 +74,8 @@ struct Ui
     unsigned shownSlotMask = 0;
     bool     suppress      = false;
     bool     centered      = false;
+    HICON    bigIcon       = nullptr;
+    HICON    smallIcon     = nullptr;
     unsigned themeGen      = 0;
     int      tick          = 0;
 
@@ -85,6 +88,8 @@ struct Ui
     bool                 isPs4      = false;
     int                  ps4Home    = -1;
     bool                 ownsShared = true;
+    bool                 noSplitSpace = false;
+    bool                 ps4Split     = false;
 
     ui::Chip          chips[kVCamCount];
     ui::StatusPill    pill;
@@ -98,6 +103,7 @@ struct Ui
     ui::ToggleRow splitTgl, keepAwakeTgl, autostartTgl;
 
     ui::InfoText  sharedNote;   // "these are set on the Left half"
+    ui::InfoText  splitNote;    // "free a slot to split", beside the toggle
     ui::MeterBank meters;
     ui::InfoText  micStatus, micOutStatus;
     ui::Button    recordBtn, resetBtn, closeBtn;
@@ -190,14 +196,14 @@ void Reload(bool withGlobals = true);
 
 void ApplyLive()
 {
-    if (g->suppress) return;
+    if (g->suppress || !g->dlg) return;
     g->tray->ApplySettings(g->slot, Snapshot(), false);
     SetTimer(g->dlg, kPersistTimer, kPersistMs, nullptr);
 }
 
 void ApplyAndPersist()
 {
-    if (g->suppress) return;
+    if (g->suppress || !g->dlg) return;
     g->tray->ApplySettings(g->slot, Snapshot(), true);
 }
 
@@ -362,7 +368,7 @@ bool UpdateMicOutputStatus()
     audiostatus::Block b{};
     // Fresh() as well as Read(): the block is published per captured frame, so a
     // sleeping camera would otherwise leave the last snapshot on screen.
-    const bool live = g->micStatusReader.Open() && g->micStatusReader.Read(b) &&
+    const bool live = g->micStatusReader.Open(g->ps4Home >= 0 ? g->ps4Home : g->slot) && g->micStatusReader.Read(b) &&
                       audiostatus::Reader::Fresh(b) && b.renderActive;
     const audiorender::Endpoint& e = g->micOutputs[(size_t)sel - 1];
 
@@ -375,11 +381,11 @@ bool UpdateMicOutputStatus()
         // no length this code controls. swprintf_s would abort the tray on an
         // overlong one; losing the tail of a sentence is the right failure.
         _snwprintf_s(text, _TRUNCATE,
-                   L"Playing at %u Hz, %u ms buffered. In other apps, choose "
+                   L"All PS4 microphones share this output. Playing at %u Hz, %u ms buffered. In other apps, choose "
                    L"\"%s\" as the microphone.",
                    b.endpointRate, b.renderFillMs, e.captureName.c_str());
     else
-        swprintf_s(text, L"Playing at %u Hz, %u ms buffered. Monitoring only — "
+        swprintf_s(text, L"All PS4 microphones share this output. Playing at %u Hz, %u ms buffered. Monitoring only — "
                          L"other apps cannot record from this.",
                    b.endpointRate, b.renderFillMs);
     return g->micOutStatus.SetText(text);
@@ -401,7 +407,7 @@ void UpdateMic(bool withText)
         g->meters.Invalidate();
 
     g->recordBtn.Enable(live);
-    g->recordBtn.SetText(c->MicRecording() ? L"Stop" : L"Record");
+    g->recordBtn.SetText(c->MicRecordingRequested() ? L"Stop" : L"Record");
 
     if (!withText)
         return;
@@ -410,12 +416,19 @@ void UpdateMic(bool withText)
     // at the moment a camera is selected. This is the interlock half, which
     // says why the block is inactive.
     wchar_t text[320];
-    if (c->MicRecording())
+    if (c->MicRecordingState() == RecordingCommands::State::Failed)
+        wcscpy_s(text, L"Recording failed — check the output folder and available disk space.");
+    else if (c->MicRecordingState() == RecordingCommands::State::Starting)
+        wcscpy_s(text, L"Starting recording…");
+    else if (c->MicRecordingState() == RecordingCommands::State::Stopping)
+        wcscpy_s(text, L"Finishing recording…");
+    else if (c->MicRecording())
         swprintf_s(text, L"Recording… %u s (%u ch, 48 kHz)",
                    c->MicRecordedSeconds(), ch);
     else if (!c->MicRecordingPath().empty())
     {
-        const wchar_t* full = c->MicRecordingPath().c_str();
+        const std::wstring path = c->MicRecordingPath();
+        const wchar_t* full = path.c_str();
         const wchar_t* name = wcsrchr(full, L'\\');
         // _TRUNCATE: a path with no separator falls back to the whole thing,
         // which can be MAX_PATH long — swprintf_s would abort rather than fit.
@@ -497,8 +510,7 @@ void PlaceSection(layout::Column& col, Sec s)
     col.Gap(kRowGap);
 
     // Say why the picture controls are inactive on a split pair's Right half,
-    // the way the microphone block already does. Greying with no reason reads
-    // as a fault.
+    // as the microphone block does. Greying with no reason reads as a fault.
     if (s == Sec::Image && !g->ownsShared)
     {
         g->sharedNote.Move(col.Next(30));
@@ -534,6 +546,7 @@ void HideEverything()
     g->splitTgl.Show(false);
     g->keepAwakeTgl.Show(false);
     g->sharedNote.Show(false);
+    g->splitNote.Show(false);
     g->meters.Show(false);
     g->micStatus.Show(false);
     g->micOutStatus.Show(false);
@@ -544,7 +557,6 @@ void HideEverything()
 void Relayout()
 {
     if (!g->dlg) return;
-    const unsigned epochBefore = ui::LayoutEpoch();
     ui::BeginLayoutPass();
 
     // A theme or DPI change frees the font the native combos were handed, and
@@ -651,6 +663,12 @@ void Relayout()
         PlaceCaptionCombo(left, g->viewCap, g->viewCombo, 3);
         g->splitTgl.Move(left.Next(kRowH));
         g->splitTgl.Show(true);
+        // The reason sits under the control it greys, not in another column.
+        if (g->noSplitSpace)
+        {
+            g->splitNote.Move(left.Next(30));
+            g->splitNote.Show(true);
+        }
     }
 
     if (g->mask & CTRL_MICARRAY)
@@ -756,15 +774,12 @@ void Relayout()
 
     ui::EndLayoutPass();   // applies only the visibility that really changed
 
-    // Repaint the PARENT only if the layout actually moved. A widget that
-    // shifted repaints itself, but the background it vacated is the dialog's,
-    // so that case needs the erase. A pass where nothing moved -- the common
-    // one, since most reloads re-run the identical layout -- needs neither;
-    // erasing regardless flashes the whole window on every settings change.
-    // A resize re-flows everything, so that one repaints wholesale. Otherwise
-    // repaint ONLY the ground widgets vacated -- everything that moved or
-    // appeared has already painted itself. A pass that shifted nothing (the
-    // common case) invalidates nothing at all.
+    // A resize re-flows everything, so that one repaints the parent wholesale.
+    // Otherwise repaint ONLY the ground widgets vacated: a widget that moved or
+    // appeared paints itself, but the background it left is the dialog's. A
+    // pass that shifted nothing -- the common one, since most reloads re-run
+    // the identical layout -- invalidates nothing; erasing regardless flashes
+    // the whole window on every settings change.
     RECT vacated{};
     if (resized)
         InvalidateRect(g->dlg, nullptr, TRUE);
@@ -790,6 +805,17 @@ void CenterOnce()
 
 // ---------------------------------------------------------------------------
 // Load
+
+// Split needs a free slot for the Right half, and whether one exists depends
+// on OTHER cameras -- so this is re-run whenever slot membership changes, not
+// only when the viewed camera does.
+void UpdateSplitAvailability()
+{
+    g->noSplitSpace = g->isPs4 && !g->ps4Split &&
+        deviceregistry::OccupiedSlotMask() == ((1u << kVCamCount) - 1);
+    if (g->isPs4)
+        g->splitTgl.Enable(!g->noSplitSpace);
+}
 
 // Which slots get a chip: whichever ones the slot map has a device for, and
 // nothing else.
@@ -866,8 +892,13 @@ void Reload(bool withGlobals)
     // The Right half of a split pair does not own the shared ISP, so its ISP
     // controls grey. Flip is per-view software mirroring and stays live.
     g->ownsShared = !(ps4.isPs4 && ps4.split && ps4.view == Ps4ViewKind::Right);
+    g->ps4Split = ps4.split;
+    UpdateSplitAvailability();
 
     const Settings s = settings::Load(g->slot);
+    const Settings shared =
+        (!g->ownsShared && g->ps4Home >= 0 && g->ps4Home != g->slot)
+            ? settings::Load(g->ps4Home) : s;
 
     g->modeCombo.Clear();
     for (int i = 0; i < g->modeCount; ++i)
@@ -879,23 +910,20 @@ void Reload(bool withGlobals)
     }
     int sel = -1;
     for (int i = 0; i < g->modeCount; ++i)
-        if (g->modes[i].width == s.width && g->modes[i].height == s.height &&
-            g->modes[i].fps == s.fps) { sel = i; break; }
+        if (g->modes[i].width == shared.width && g->modes[i].height == shared.height &&
+            g->modes[i].fps == shared.fps) { sel = i; break; }
     if (sel < 0 && g->prof)
         for (int i = 0; i < g->modeCount; ++i)
             if (g->modes[i].width == g->prof->defaultMode.width &&
                 g->modes[i].height == g->prof->defaultMode.height &&
                 g->modes[i].fps == g->prof->defaultMode.fps) { sel = i; break; }
     g->modeCombo.SetCurSel(sel < 0 ? 0 : sel);
+    g->modeCombo.Enable(g->ownsShared);
 
     // A split pair shares one ISP, driven solely by the home (Left) half, so the
     // shared rows read from the home slot. The non-owner's own stored values are
     // never sent anywhere -- showing them would put two different numbers on one
     // piece of hardware. Per-view rows (flip) still come from this slot.
-    const Settings shared =
-        (!g->ownsShared && g->ps4Home >= 0 && g->ps4Home != g->slot)
-            ? settings::Load(g->ps4Home) : s;
-
     for (int i = 0; i < model::kSliderCount; ++i)
     {
         if (!SliderShown(i)) continue;
@@ -918,7 +946,7 @@ void Reload(bool withGlobals)
         g->flickCombo.Add(L"Off");
         g->flickCombo.Add(L"50 Hz");
         g->flickCombo.Add(L"60 Hz");
-        g->flickCombo.SetCurSel((int)(s.powerlineFreq > 2 ? 1 : s.powerlineFreq));
+        g->flickCombo.SetCurSel((int)(shared.powerlineFreq > 2 ? 1 : shared.powerlineFreq));
     }
 
     if (g->isPs4)
@@ -966,20 +994,27 @@ void SelectSlot(int slot)
 
 void ResetDefaults()
 {
-    Settings d = settings::Defaults();
-    if (g->prof)
+    FlushPersist();
+    const Settings defaults = settings::Defaults();
+    Settings local = settings::Load(g->slot);
+    const int owner = g->isPs4 && g->ps4Home >= 0 ? g->ps4Home : g->slot;
+    Settings shared = settings::Load(owner);
+    for (const auto& d : model::kSliders)
     {
-        d.width  = g->prof->defaultMode.width;
-        d.height = g->prof->defaultMode.height;
-        d.fps    = g->prof->defaultMode.fps;
+        if (d.sharedHw) shared.*d.field = defaults.*d.field;
+        else local.*d.field = defaults.*d.field;
     }
-    settings::Save(g->slot, d);
-    // Defaults carry ps4Split=false, so resetting a split pair's home slot
-    // dissolves it -- a slot-map change, which needs a rescan.
-    if (g->isPs4)
-        g->tray->RescanAllControllers();
+    for (const auto& d : model::kToggles)
+    {
+        if (d.sharedHw) shared.*d.field = defaults.*d.field;
+        else local.*d.field = defaults.*d.field;
+    }
+    shared.powerlineFreq = defaults.powerlineFreq;
+    if (owner == g->slot)
+    { shared.flipH = local.flipH; shared.flipV = local.flipV; local = shared; }
+    else g->tray->ApplySettings(owner, shared, true);
+    g->tray->ApplySettings(g->slot, local, true);
     Reload(false);
-    g->tray->ApplySettings(g->slot, d, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -990,11 +1025,19 @@ void OnViewChanged()
     if (g->suppress || !g->isPs4 || g->ps4Home < 0) return;
     const int v = g->viewCombo.CurSel();
     if (v < 0) return;
+    FlushPersist();
     // Persist first: the rescan is what makes a streaming slot re-create its
     // device, and it must read the new value.
     Settings hs = settings::Load(g->ps4Home);
+    const auto mode = deviceregistry::ReframePs4Mode(VideoMode{hs.width, hs.height, hs.fps},
+        static_cast<Ps4ViewKind>(hs.ps4View), static_cast<Ps4ViewKind>(v));
+    hs.width = mode.width;
+    const auto& profile = Ps4ViewProfile(static_cast<Ps4ViewKind>(v));
+    if (!ProfileHasMode(profile, hs.width, hs.height, hs.fps))
+    { hs.width = profile.defaultMode.width; hs.height = profile.defaultMode.height; hs.fps = profile.defaultMode.fps; }
     hs.ps4View = (uint32_t)v;
     settings::Save(g->ps4Home, hs);
+    g->tray->ApplySettings(g->ps4Home, hs, false, true);
     g->tray->RescanAllControllers();
     Reload(false);
     if (g->preview) g->preview->SetCamera(g->slot);
@@ -1003,8 +1046,19 @@ void OnViewChanged()
 void OnSplitToggled()
 {
     if (g->suppress || !g->isPs4 || g->ps4Home < 0) return;
-    Settings hs = settings::Load(g->ps4Home);
+    FlushPersist();
+    const int home = g->ps4Home;
+    Settings hs = settings::Load(home);
     const bool want = g->splitTgl.Checked();
+    if (want && deviceregistry::OccupiedSlotMask() == ((1u << kVCamCount) - 1))
+    { Reload(false); return; }
+    const auto current = deviceregistry::QueryPs4Slot(home);
+    const Ps4ViewKind next = want ? Ps4ViewKind::Left : static_cast<Ps4ViewKind>(hs.ps4View);
+    const auto mode = deviceregistry::ReframePs4Mode(VideoMode{hs.width, hs.height, hs.fps}, current.view, next);
+    hs.width = mode.width;
+    const auto& profile = Ps4ViewProfile(next);
+    if (!ProfileHasMode(profile, hs.width, hs.height, hs.fps))
+    { hs.width = profile.defaultMode.width; hs.height = profile.defaultMode.height; hs.fps = profile.defaultMode.fps; }
     hs.ps4Split = want;
     if (want)
     {
@@ -1016,7 +1070,9 @@ void OnSplitToggled()
         hs.ps4SplitOwner = pp.empty() ? 0u : deviceregistry::Ps4OwnerHash(pp);
     }
     settings::Save(g->ps4Home, hs);
+    g->tray->ApplySettings(home, hs, false, true);
     g->tray->RescanAllControllers();
+    if (!want) g->slot = home;
     Reload(false);
     if (g->preview) g->preview->SetCamera(g->slot);
 }
@@ -1037,7 +1093,7 @@ void OnMicOutChanged()
 void OnRecord()
 {
     CaptureController* c = Ctl();
-    if (c->MicRecording())
+    if (c->MicRecordingRequested())
     {
         c->MicStopRecording();
     }
@@ -1159,9 +1215,13 @@ void CreateWidgets()
     g->autostartTgl.onToggle = [] { OnAutostart(); };
 
     g->sharedNote.Create(d, z);
-    g->sharedNote.SetText(L"Both halves share one image processor, so these are set on "
-                          L"the Left camera of the split pair.");
+    g->sharedNote.SetText(L"Both halves share one image processor, so these controls "
+                          L"and the mode are set on the Left camera.");
     g->sharedNote.Show(false);
+
+    g->splitNote.Create(d, z);
+    g->splitNote.SetText(L"All 8 camera slots are in use; free a slot to split.");
+    g->splitNote.Show(false);
 
     g->meters.Create(d, z);
     g->micStatus.Create(d, z);
@@ -1182,7 +1242,7 @@ void CreateWidgets()
     g->recordBtn.Create(d, z, L"Record", ui::Button::Kind::Secondary);
     g->recordBtn.onClick = [] { OnRecord(); };
 
-    g->resetBtn.Create(d, z, L"Reset defaults", ui::Button::Kind::Secondary);
+    g->resetBtn.Create(d, z, L"Reset controls", ui::Button::Kind::Secondary);
     g->resetBtn.onClick = [] { ResetDefaults(); };
 
     g->closeBtn.Create(d, z, L"Close", ui::Button::Kind::Primary);
@@ -1210,10 +1270,10 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         theme::SetDpi((int)GetDpiForWindow(dlg));
         theme::ApplyWindowFrame(dlg);
 
-        HICON big   = (HICON)LoadImageW(g->inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 32, 32, 0);
-        HICON small = (HICON)LoadImageW(g->inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 16, 16, 0);
-        SendMessageW(dlg, WM_SETICON, ICON_BIG,   (LPARAM)big);
-        SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)small);
+        g->bigIcon = (HICON)LoadImageW(g->inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 32, 32, 0);
+        g->smallIcon = (HICON)LoadImageW(g->inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 16, 16, 0);
+        SendMessageW(dlg, WM_SETICON, ICON_BIG,   (LPARAM)g->bigIcon);
+        SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)g->smallIcon);
 
         CreateWidgets();
 
@@ -1308,6 +1368,8 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
 
     case WM_DESTROY:
+        if (HWND captured = GetCapture(); captured && IsChild(dlg, captured))
+            SendMessageW(captured, WM_CANCELMODE, 0, 0);
         KillTimer(dlg, kTickTimer);
         FlushPersist();
         // Nothing of ours stays mapped or running while the window is closed:
@@ -1315,6 +1377,9 @@ INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         g->preview.reset();
         g->micStatusReader.Close();
         g->micOutputs.clear();
+        if (g->bigIcon) DestroyIcon(g->bigIcon);
+        if (g->smallIcon) DestroyIcon(g->smallIcon);
+        g->bigIcon = g->smallIcon = nullptr;
         g->dlg = nullptr;
         return TRUE;
     }
@@ -1375,6 +1440,7 @@ void RefreshCameraList()
     {
         g->suppress = true;
         RefreshChips();
+        UpdateSplitAvailability();
         Relayout();
         g->suppress = false;
         return;

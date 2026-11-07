@@ -1,6 +1,6 @@
-# CI build: every push / PR compiles all three artifacts (unsigned) so build
-# breaks surface immediately and SignPath's "trusted build system" requirement
-# is met by a working GitHub Actions pipeline.
+# CI: every push and pull request builds all three artifacts and runs the
+# hardware-free regression suites, so build breaks and test failures surface
+# before a release is tagged.
 name: build
 
 on:
@@ -18,10 +18,14 @@ jobs:
         shell: cmd
         run: build.bat
 
-      - name: Upload unsigned artifacts
+      - name: Software regression tests
+        shell: cmd
+        run: tests\build.bat
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PSCam4Win-unsigned-${{ github.sha }}
+          name: PSCam4Win-${{ github.sha }}
           path: |
             build/PSCam4Win.dll
             build/PSCam4WinTray.exe

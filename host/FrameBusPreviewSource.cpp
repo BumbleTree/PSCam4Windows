@@ -23,25 +23,22 @@ bool FrameBusPreviewSource::ReadFormat(uint32_t& width, uint32_t& height, uint32
     framebus::HotHeader h{};
     if (!_reader.ReadFormat(h))
         return false;
-    width  = h.width;
-    height = h.height;
+    _width = width = h.width;
+    _height = height = h.height;
     fps    = h.fpsNum / (h.fpsDen ? h.fpsDen : 1);
     return true;
 }
 
 void FrameBusPreviewSource::WaitFrame(DWORD timeoutMs) const
 {
-    // INVARIANT: poll the seqlock, never wait on the shared
-    // ".FrameReady" event. It is auto-reset, so SetEvent wakes exactly ONE
-    // waiter; the single permitted waiter is the virtual camera DLL's
-    // DeliverSample. Waiting here would steal its wakeups and starve clients
-    // (OBS/Discord). Keep this a Sleep — do not convert it to an event wait.
+    // Keep this a Sleep — never an event wait on ".FrameReady", which would
+    // steal the DLL's wakeups (see the INVARIANT in the header).
     Sleep(timeoutMs < 16 ? timeoutMs : 16);
 }
 
 LONG64 FrameBusPreviewSource::TryReadNewer(uint8_t* dst, uint32_t dstBytes, LONG64 lastFrameId)
 {
-    return _reader.TryReadNewer(dst, dstBytes, lastFrameId);
+    return _reader.TryReadNewer(dst, dstBytes, lastFrameId, _width, _height);
 }
 
 bool FrameBusPreviewSource::IsCameraInUse(uint32_t idleTimeoutMs) const

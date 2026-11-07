@@ -3,6 +3,7 @@
 // mandatory rather than a refinement.
 //
 #include "AudioRender.h"
+#include "../common/AudioRate.h"
 
 #include <windows.h>
 #include <initguid.h>            // DEFINE the PROPERTYKEYs, don't just declare
@@ -10,13 +11,15 @@
 #include <audioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <avrt.h>
+#include <wrl/client.h>
 
 #include <algorithm>
-#include <cmath>
 #include <mutex>
 #include <thread>
 
 #pragma comment(lib, "avrt.lib")
+
+using Microsoft::WRL::ComPtr;
 
 namespace audiorender {
 
@@ -29,10 +32,10 @@ static const GUID kSubFloat =
 // here come back out of some capture device that other apps can select?
 //
 // This is the question the user actually has ("will Discord see my mic?"), and
-// name-matching alone answers it wrongly. A first pass flagged "Steam Streaming
-// Speakers", which is Remote Play's output, not a loopback: nothing local
-// captures it. So a render endpoint is only called a cable when its PARTNER
-// CAPTURE ENDPOINT IS ACTUALLY PRESENT on this machine.
+// name-matching alone answers it wrongly: "Steam Streaming Speakers" looks like
+// a cable but is Remote Play's output, not a loopback — nothing local captures
+// it. So a render endpoint is only called a cable when its PARTNER CAPTURE
+// ENDPOINT IS ACTUALLY PRESENT on this machine.
 //
 // Pairs are matched by product marker rather than exact name because vendors
 // decorate these with driver revisions and numbering.
@@ -59,14 +62,13 @@ static bool ContainsI(const std::wstring& hay, const wchar_t* needle)
 
 static std::wstring FriendlyName(IMMDevice* d)
 {
-    IPropertyStore* ps = nullptr;
+    ComPtr<IPropertyStore> ps;
     if (FAILED(d->OpenPropertyStore(STGM_READ, &ps)) || !ps) return L"";
     PROPVARIANT pv; PropVariantInit(&pv);
     std::wstring out;
     if (SUCCEEDED(ps->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR)
         out = pv.pwszVal;
     PropVariantClear(&pv);
-    ps->Release();
     return out;
 }
 
@@ -75,16 +77,15 @@ static std::wstring FriendlyName(IMMDevice* d)
 static std::vector<std::wstring> CaptureNames(IMMDeviceEnumerator* en)
 {
     std::vector<std::wstring> out;
-    IMMDeviceCollection* col = nullptr;
+    ComPtr<IMMDeviceCollection> col;
     if (SUCCEEDED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &col)) && col)
     {
         UINT n = 0; col->GetCount(&n);
         for (UINT i = 0; i < n; ++i)
         {
-            IMMDevice* d = nullptr;
-            if (SUCCEEDED(col->Item(i, &d)) && d) { out.push_back(FriendlyName(d)); d->Release(); }
+            ComPtr<IMMDevice> d;
+            if (SUCCEEDED(col->Item(i, &d)) && d) out.push_back(FriendlyName(d.Get()));
         }
-        col->Release();
     }
     return out;
 }
@@ -98,47 +99,45 @@ std::vector<Endpoint> ListEndpoints()
     // anything that SUCCEEDED must be balanced below.
     const bool weInit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
 
-    IMMDeviceEnumerator* en = nullptr;
-    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                   __uuidof(IMMDeviceEnumerator), (void**)&en)) && en)
-    {
-        std::wstring defaultId;
-        IMMDevice* def = nullptr;
-        if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &def)) && def)
+    {   // every COM pointer is released at the end of this scope, before CoUninitialize
+        ComPtr<IMMDeviceEnumerator> en;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                       IID_PPV_ARGS(&en))) && en)
         {
-            LPWSTR id = nullptr;
-            if (SUCCEEDED(def->GetId(&id)) && id) { defaultId = id; CoTaskMemFree(id); }
-            def->Release();
-        }
-        const std::vector<std::wstring> captures = CaptureNames(en);
-        IMMDeviceCollection* col = nullptr;
-        if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col)) && col)
-        {
-            UINT n = 0; col->GetCount(&n);
-            for (UINT i = 0; i < n; ++i)
+            std::wstring defaultId;
+            ComPtr<IMMDevice> def;
+            if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &def)) && def)
             {
-                IMMDevice* d = nullptr;
-                if (FAILED(col->Item(i, &d)) || !d) continue;
                 LPWSTR id = nullptr;
-                if (SUCCEEDED(d->GetId(&id)) && id)
-                {
-                    Endpoint e;
-                    e.id = id;
-                    e.name = FriendlyName(d);
-                    e.isDefault = (e.id == defaultId);
-                    for (const auto& pr : kCablePairs)
-                        if (ContainsI(e.name, pr.renderMark))
-                            for (const auto& cn : captures)
-                                if (ContainsI(cn, pr.captureMark))
-                                { e.looksLikeVirtualCable = true; e.captureName = cn; break; }
-                    out.push_back(std::move(e));
-                    CoTaskMemFree(id);
-                }
-                d->Release();
+                if (SUCCEEDED(def->GetId(&id)) && id) { defaultId = id; CoTaskMemFree(id); }
             }
-            col->Release();
+            const std::vector<std::wstring> captures = CaptureNames(en.Get());
+            ComPtr<IMMDeviceCollection> col;
+            if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col)) && col)
+            {
+                UINT n = 0; col->GetCount(&n);
+                for (UINT i = 0; i < n; ++i)
+                {
+                    ComPtr<IMMDevice> d;
+                    if (FAILED(col->Item(i, &d)) || !d) continue;
+                    LPWSTR id = nullptr;
+                    if (SUCCEEDED(d->GetId(&id)) && id)
+                    {
+                        Endpoint e;
+                        e.id = id;
+                        e.name = FriendlyName(d.Get());
+                        e.isDefault = (e.id == defaultId);
+                        for (const auto& pr : kCablePairs)
+                            if (ContainsI(e.name, pr.renderMark))
+                                for (const auto& cn : captures)
+                                    if (ContainsI(cn, pr.captureMark))
+                                    { e.looksLikeVirtualCable = true; e.captureName = cn; break; }
+                        out.push_back(std::move(e));
+                        CoTaskMemFree(id);
+                    }
+                }
+            }
         }
-        en->Release();
     }
     if (weInit) CoUninitialize();
 
@@ -157,8 +156,7 @@ struct Renderer::Impl
     // ---- ring, capture thread writes / render thread reads ----------------
     // Half a second is far more than the working depth; the headroom exists so
     // a scheduling hiccup on either side costs latency rather than a dropout.
-    static const uint32_t kRingFrames = 24000;      // 0.5 s at 48 kHz
-    static const uint32_t kMaxSrcCh   = 4;
+    static constexpr uint32_t kRingFrames = 24000;  // 0.5 s at 48 kHz
     int16_t  ring[kRingFrames * 2] = {};            // up to stereo
     uint32_t ringCh = 1;
     std::atomic<uint64_t> wpos{ 0 }, rpos{ 0 };
@@ -167,7 +165,7 @@ struct Renderer::Impl
     // Target depth. Big enough to absorb the camera's 60 Hz burst cadence (a
     // whole video frame of audio arrives at once), small enough to stay a
     // sensible monitoring latency.
-    static const uint32_t kTargetMs = 40;
+    static constexpr uint32_t kTargetMs = 40;
     double   phase = 0.0;             // fractional read position within the ring
     double   ratio = 1.0;             // read step; 1.0 = source and sink agree
     double   prev[2] = {};            // last emitted, for the interpolator tail
@@ -177,6 +175,7 @@ struct Renderer::Impl
     std::atomic<int32_t>  correctionPpm{ 0 };
     std::atomic<uint64_t> underruns{ 0 }, overruns{ 0 };
     std::atomic<uint32_t> endpointRate{ 0 }, endpointChans{ 0 };
+    std::atomic<bool> ready{false};
 
     std::wstring deviceId;
     Downmix      mix = Downmix::Mono;
@@ -189,6 +188,9 @@ struct Renderer::Impl
     {
         wpos.store(0); rpos.store(0);
         phase = 0.0; ratio = 1.0;
+        srcRateMilliHz.store(0);
+        ready.store(false);
+        endpointRate.store(0); endpointChans.store(0);
         prev[0] = prev[1] = 0.0;
         fillMs.store(0); correctionPpm.store(0);
         underruns.store(0); overruns.store(0);
@@ -290,7 +292,7 @@ void Renderer::Push(const int16_t* src, uint32_t frames, uint32_t channels,
 Status Renderer::GetStatus() const
 {
     Status s;
-    s.active        = _running.load(std::memory_order_acquire);
+    s.active        = _impl->ready.load(std::memory_order_acquire);
     s.fillMs        = _impl->fillMs.load(std::memory_order_relaxed);
     s.correctionPpm = _impl->correctionPpm.load(std::memory_order_relaxed);
     s.underruns     = _impl->underruns.load(std::memory_order_relaxed);
@@ -315,6 +317,7 @@ void Renderer::Impl::Run()
     HANDLE               mmcss = nullptr;
 
     auto cleanup = [&] {
+        ready.store(false, std::memory_order_release);
         if (ac) ac->Stop();
         if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
         if (rc) rc->Release();
@@ -344,6 +347,7 @@ void Renderer::Impl::Run()
     const uint32_t sinkCh   = wfx->nChannels;
     const uint32_t sinkRate = wfx->nSamplesPerSec;
     const uint32_t sinkBytes = wfx->wBitsPerSample / 8;
+    if (!sinkRate || !sinkCh) { cleanup(); return; }
 
     // The fan-out at the bottom of this function writes float32, int16 or
     // int32 and nothing else. At any other sample width it writes NOTHING —
@@ -379,41 +383,43 @@ void Renderer::Impl::Run()
     // start would otherwise pin the loop's operating point at 1.0 for its whole
     // life, leaving the camera's real +483 ppm to be carried as a standing fill
     // offset by the proportional term alone.
-    auto nominalRatio = [&]() -> double {
-        const uint32_t r = srcRateMilliHz.load(std::memory_order_relaxed);
-        const double n = r ? (double)r / 1000.0 / (double)sinkRate : 1.0;
-        return (n < 0.9 || n > 1.1) ? 1.0 : n;
+    auto sourceRate = [&]() -> double {
+        return SourceRate(srcRateMilliHz.load(std::memory_order_relaxed));
     };
-    ratio = nominalRatio();
-
-    const uint32_t targetFrames = sinkRate * kTargetMs / 1000;
+    ratio = sourceRate() / sinkRate;
 
     // Prime: hand the engine silence until we have a working depth, otherwise
     // the first callbacks underrun before the camera has produced anything.
-    ac->Start();
+    if (FAILED(ac->Start())) { cleanup(); return; }
+    ready.store(true, std::memory_order_release);
     bool primed = false;
 
     while (!stop.load(std::memory_order_acquire))
     {
-        if (WaitForSingleObject(evt, 200) != WAIT_OBJECT_0)
-            continue;
+        const DWORD wait = WaitForSingleObject(evt, 200);
+        if (wait == WAIT_FAILED) break;
 
         UINT32 padding = 0;
         if (FAILED(ac->GetCurrentPadding(&padding))) break;
+        if (wait != WAIT_OBJECT_0) continue;
         const UINT32 want = bufFrames > padding ? bufFrames - padding : 0;
         if (!want) continue;
 
         BYTE* out = nullptr;
-        if (FAILED(rc->GetBuffer(want, &out)) || !out) continue;
+        hr = rc->GetBuffer(want, &out);
+        if (hr == AUDCLNT_E_BUFFER_ERROR) continue;
+        if (FAILED(hr) || !out) break;
 
         const uint32_t avail = Fill();
-        fillMs.store(sinkRate ? avail * 1000 / sinkRate : 0, std::memory_order_relaxed);
+        const double rate = sourceRate();
+        const double targetFrames = rate * kTargetMs / 1000.0;
+        fillMs.store(static_cast<uint32_t>(avail * 1000.0 / rate), std::memory_order_relaxed);
 
         if (!primed)
         {
             if (avail < targetFrames)
             {
-                rc->ReleaseBuffer(want, AUDCLNT_BUFFERFLAGS_SILENT);
+                if (FAILED(rc->ReleaseBuffer(want, AUDCLNT_BUFFERFLAGS_SILENT))) break;
                 continue;
             }
             primed = true;
@@ -427,13 +433,10 @@ void Renderer::Impl::Run()
         // approaching a percent means something else is wrong and we would
         // rather glide than chase it.
         {
-            const double err = ((double)avail - (double)targetFrames) / (double)targetFrames;
-            const double kp  = 0.02;
-            double target = nominalRatio() * (1.0 + kp * err);
-            if (target < 0.97) target = 0.97;
-            if (target > 1.03) target = 1.03;
+            const double nominal = rate / sinkRate;
+            const double target = TargetRatio(rate, sinkRate, avail, targetFrames);
             ratio += (target - ratio) * 0.05;          // slew, so it never steps
-            correctionPpm.store((int32_t)((ratio - 1.0) * 1e6), std::memory_order_relaxed);
+            correctionPpm.store((int32_t)((ratio / nominal - 1.0) * 1e6), std::memory_order_relaxed);
         }
 
         // ---- resample ring -> endpoint ------------------------------------
@@ -450,13 +453,14 @@ void Renderer::Impl::Run()
                 const size_t a = (size_t)(r % kRingFrames) * oc;
                 const size_t b = (size_t)((r + 1) % kRingFrames) * oc;
                 const double t = phase;
+                // Linear interpolation is ample at a ratio this close to 1.
                 for (uint32_t c = 0; c < oc; ++c)
-                    s[c] = ring[a + c] * (1.0 - t) + ring[b + c] * t;   // linear is
-                                                                        // ample at
-                                                                        // ratio ~1
+                    s[c] = ring[a + c] * (1.0 - t) + ring[b + c] * t;
                 prev[0] = s[0]; prev[1] = s[1];
                 phase += ratio;
-                while (phase >= 1.0) { phase -= 1.0; ++r; }
+                const uint64_t advance = static_cast<uint64_t>(phase);
+                r += std::min(advance, w - r);
+                phase -= static_cast<double>(advance);
             }
             else
                 starved = true;    // hold the last sample rather than click
@@ -484,7 +488,7 @@ void Renderer::Impl::Run()
         }
         rpos.store(r, std::memory_order_release);
         if (starved) underruns.fetch_add(1, std::memory_order_relaxed);
-        rc->ReleaseBuffer(want, 0);
+        if (FAILED(rc->ReleaseBuffer(want, 0))) break;
     }
     cleanup();
 }

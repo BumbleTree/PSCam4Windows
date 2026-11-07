@@ -6,7 +6,7 @@
 // Separate from the PS3 driver's context (ctx #1, which that vendored fork
 // creates and owns itself — see third_party/ps3eye/README.md) and
 // the EyeToy's context (ctx #2) for the same two reasons as the EyeToy split,
-// plus one more that matters here: the PS4 camera streams raw-Bayer stereo at
+// plus one more that matters here: the PS4 camera streams stereo video at
 // ~275 MB/s on SuperSpeed iso, so its completion handling must never share a
 // thread with the lighter EyeToy/PS3 paths or it could starve them (and vice
 // versa). One context, one event thread, ref-counted Acquire/Release so an idle
@@ -14,21 +14,18 @@
 //
 // The PS4 camera lives in THREE USB identities: 05A9:0580 (OV580 bootloader,
 // "USB Boot") before firmware; then, depending on which firmware build was
-// uploaded, 05A9:058A ("USB Camera-OV580", flat device — legacy ps4eye blob)
-// or 05A9:058B (same name but a COMPOSITE device with an IAD video function,
-// WinUSB-bound at MI_00 — the final PS4-sys-6.00+ build). It re-enumerates AT
-// THE SAME PHYSICAL PORT PATH during firmware upload, so the port path — not
-// the VID/PID — is the stable slot key, and IsPs4()/enumeration deliberately
-// match all three PIDs.
+// uploaded, 05A9:058B ("USB Camera-OV580", a COMPOSITE device with an IAD
+// video function, WinUSB-bound at MI_00 — the final PS4-sys-6.00+ build, the
+// only one this project uploads) or 05A9:058A (same name, flat device — the
+// older ps4eye blob, still present on a camera that has not been replugged
+// since one was uploaded). It re-enumerates AT THE SAME PHYSICAL PORT PATH
+// during firmware upload, so the port path — not the VID/PID — is the stable
+// slot key, and IsPs4()/enumeration deliberately match all three PIDs.
 //
 #include <string>
 #include <vector>
 
 #include "../../common/UsbCore.h"
-
-struct libusb_context;
-struct libusb_device;
-struct libusb_device_handle;
 
 namespace ps4 {
 
@@ -39,12 +36,10 @@ constexpr unsigned short kPidRunNew = 0x058B;   // streaming, final (6.00+) firm
 
 // Matches the PS4 camera in ANY state (boot or either streaming identity).
 bool IsPs4(unsigned short vid, unsigned short pid);
-bool IsPs4Boot(unsigned short vid, unsigned short pid);
-bool IsPs4Run(unsigned short vid, unsigned short pid);
 
 // Stable "bus.p1.p2..." physical port-path string. The same physical port
-// yields the same string across replugs AND across the 0580->058A firmware
-// re-enumeration, so it is the slot key.
+// yields the same string across replugs AND across the 0580->058A/058B
+// firmware re-enumeration, so it is the slot key.
 std::string PortPath(libusb_device* dev);
 
 // Port paths of every PS4 camera currently present (boot or streaming), so a

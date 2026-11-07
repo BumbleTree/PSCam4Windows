@@ -1,9 +1,9 @@
 #pragma once
 //
 // Minimal local declaration of the Windows 11 virtual camera API
-// (mfvirtualcamera.h ships only with SDK >= 10.0.22000, this machine builds
-// with 10.0.19041). IIDs and vtable order were verified against the real SDK
-// header (via DirectN's generated bindings) and the Microsoft Learn docs:
+// (mfvirtualcamera.h ships only with SDK >= 10.0.22000, and the build must work
+// with 10.0.19041). IIDs and vtable order match the real SDK header and the
+// Microsoft Learn docs:
 //   IMFVirtualCamera    {1C08A864-EF6C-4C75-AF59-5F2D68DA9563}
 //   IMFCameraSyncObject {6338B23A-3042-49D2-A3EA-EC0FED815407}
 // MFCreateVirtualCamera is exported from mfsensorgroup.dll (build >= 22000);

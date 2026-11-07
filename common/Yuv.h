@@ -89,8 +89,8 @@ inline void UpscaleYuy2_2x(const uint8_t* src, uint8_t* dst, uint32_t srcW, uint
         }
     }
 
-    // In YUY2 every byte column holds the same component on every row, so a
-    // byte-wise average IS a true vertical lerp; do it 8 bytes per op.
+    // Pass 2: odd rows as the byte-wise mean of their neighbours, 8 bytes per op;
+    // the last row has no lower neighbour and replicates the one above.
     for (uint32_t y = 0; y + 1 < srcH; ++y)
     {
         const uint8_t* a = dst + (y * 2) * dstStride;
